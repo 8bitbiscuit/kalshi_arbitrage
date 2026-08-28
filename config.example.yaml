@@ -1,0 +1,102 @@
+# arbmon configuration. Copy to config.yaml and edit:
+#   cp config.example.yaml config.yaml
+#   python run.py -c config.yaml scan
+#
+# Every key below is optional; the values shown are the built-in defaults.
+
+# Seconds between scans. Crypto contracts on both venues are quoted
+# continuously, so anything under ~10s mostly buys you rate-limit errors.
+scan_interval_seconds: 30
+# 0 means run until interrupted.
+max_scans: 0
+http_timeout_seconds: 25
+http_retries: 4
+user_agent: "arbmon/0.1 (research; read-only)"
+
+kalshi:
+  enabled: true
+  base_url: "https://api.elections.kalshi.com/trade-api/v2"
+  page_limit: 1000
+  max_pages: 20
+  statuses: ["open"]
+  # Restrict the crawl to specific series to cut request volume, e.g.
+  # ["KXBTCD", "KXETHD"]. Empty crawls every open market and filters locally,
+  # which is slower but survives Kalshi renaming a series.
+  series_prefixes: []
+  # Order book depth needs an API key. Without one the scanner falls back to
+  # top-of-book quotes and flags every opportunity as unsized.
+  fetch_orderbook: true
+  orderbook_depth: 20
+  # Prefer the environment for these: KALSHI_API_KEY_ID and
+  # KALSHI_PRIVATE_KEY_PATH. Anything set here wins over the environment.
+  api_key_id: null
+  private_key_path: null
+  requests_per_second: 8
+
+polymarket:
+  enabled: true
+  gamma_url: "https://gamma-api.polymarket.com"
+  clob_url: "https://clob.polymarket.com"
+  page_limit: 500
+  max_pages: 20
+  # Skip illiquid markets before spending order book requests on them.
+  min_liquidity: 500
+  min_volume: 0
+  fetch_orderbook: true
+  orderbook_batch_size: 100
+  requests_per_second: 8
+
+fees:
+  # Kalshi's trading fee is ceil(multiplier * contracts * P * (1-P)).
+  # null uses 0.07, or 0.035 for the index series that get the reduced rate.
+  kalshi_multiplier: null
+  # Only relevant if you intend to rest orders rather than cross the spread.
+  kalshi_maker: false
+  # Used when Polymarket does not report a fee rate for a market. Most crypto
+  # markets are still fee-free, so 0 is the honest default - raise it if you
+  # want a margin of safety.
+  polymarket_default_bps: 0
+  # Flat per-leg costs, e.g. amortised transfer/withdrawal costs.
+  kalshi_fixed_cost_per_trade: 0
+  polymarket_fixed_cost_per_trade: 0
+
+matching:
+  assets: ["BTC", "ETH", "SOL", "XRP", "DOGE"]
+  # Two contracts must resolve within this many seconds of each other.
+  max_resolution_delta_seconds: 3600
+  # Strikes must agree within max(strike * rel, abs).
+  strike_rel_tolerance: 0.0005
+  strike_abs_tolerance: 0.5
+  # Leave this false. A one-touch ("will BTC hit $70k by Friday") is worth
+  # strictly more than the terminal contract with the same strike, so pairing
+  # them is not a hedge - it is a naked short of the difference.
+  allow_style_mismatch: false
+  warn_on_source_mismatch: true
+
+arbitrage:
+  # An opportunity must clear all three thresholds to be reported.
+  min_profit: 1.00
+  min_edge_per_contract: 0.005
+  min_roi: 0.005
+  max_contracts: 5000
+  # Assumed size when a venue gives us no order book.
+  assumed_size_without_depth: 100
+  # Added to every fill price as a margin against the book moving. Setting this
+  # to 0.005 is a reasonable way to see which edges are real.
+  slippage_buffer: 0.00
+  # Report only opportunities backed by a real order book on both legs.
+  require_depth: false
+  # Also look for yes_ask + no_ask < 1 within a single venue.
+  include_single_venue: true
+
+storage:
+  enabled: true
+  sqlite_path: "data/arbmon.sqlite"
+  # Every quote from every scan. Answers "how long do edges survive?" later,
+  # but grows by roughly one row per market per scan.
+  record_snapshots: true
+
+output:
+  jsonl_path: "data/opportunities.jsonl"
+  verbose_pairs: false
+  max_rows: 25
