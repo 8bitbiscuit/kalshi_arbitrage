@@ -76,13 +76,20 @@ def player_state(df, maps):
 
 def team_state(df, maps):
     """Each team's map Elo and count of each map in its last POOL maps, *after* each match."""
-    rating, rows = {}, []
+    rating, last_team, rows = {}, {}, []
+    roster = df.groupby(["game_id", "team_id"], sort=False).player_id.agg(list)
     for r in df.drop_duplicates("game_id").itertuples():
-        a, b = rating.get(r.team_id, 1500.0), rating.get(r.opp_id, 1500.0)
+        for t in (r.team_id, r.opp_id):  # a new team id (e.g. a roster moving org) starts from its players' old teams
+            if t not in rating:
+                prev = [rating[last_team[p]] for p in roster.get((r.game_id, t), []) if last_team.get(p) in rating]
+                rating[t] = float(np.mean(prev)) if prev else 1500.0
+        a, b = rating[r.team_id], rating[r.opp_id]
         if r.win == r.win:  # skip maps without a recorded winner
             d = 32 * (r.win - 1 / (1 + 10 ** ((b - a) / 400)))
             a, b = a + d, b - d
         rating[r.team_id], rating[r.opp_id] = a, b
+        for t in (r.team_id, r.opp_id):
+            last_team.update(dict.fromkeys(roster.get((r.game_id, t), []), t))
         rows += [(r.team_id, r.start_date, r.map_name, a), (r.opp_id, r.start_date, r.map_name, b)]
     ts = pd.DataFrame(rows, columns=["team_id", "start_date", "map_name", "elo"])
     for m in maps:
@@ -183,25 +190,24 @@ def resolve(lines, df):
     players = recent.drop_duplicates("player_id", keep="last")  # ordered by last appearance
     players = players.assign(nick=players.nickname.map(key))
     teams = recent.drop_duplicates("team_id", keep="last")
-    team_ids = dict(zip(teams.team_name.map(team_key), teams.team_id))
-
-    def team(name):
-        hit = difflib.get_close_matches(team_key(name), list(team_ids), 1, 0.8)
-        return team_ids[hit[0]] if hit else -1
+    team_ids = dict(zip(teams.team_name.map(team_key), teams.team_id))  # exact only: fuzzy team names mis-join
 
     out = lines.assign(player_id=np.nan, team_id=-1, opp_id=-1, matched="")
     for i, ln in lines.iterrows():
-        nick, tid = key(ln.player), team(ln.team)
+        nick, tid = key(ln.player), team_ids.get(team_key(ln.team), -1)
         on_team = players[players.team_id == tid]
         exact = players[players.nick == nick]
         close = difflib.get_close_matches(nick, list(on_team.nick), 1, 0.6)
-        # Same team + exact name, then same team + close name, then exact name anywhere (most recent).
-        p = (exact[exact.team_id == tid] if (exact.team_id == tid).any() else
+        # Exact name on the team, then exact name anywhere (transfers), then a close name on the team
+        # (Sleeper "MaxOff" = bo3 "max"). Always the most recently active candidate.
+        p = (exact[exact.team_id == tid] if (exact.team_id == tid).any() else exact if len(exact) else
              on_team[on_team.nick == close[0]] if close else exact)
         if len(p):
             p = p.iloc[-1]
+            # Show the bo3 team when it differs, so a namesake on another team is easy to spot.
+            shown = p.nickname if p.team_id == tid else f"{p.nickname} ({p.team_name})"
             out.loc[i, ["player_id", "team_id", "opp_id", "matched"]] = [
-                p.player_id, tid if tid != -1 else p.team_id, team(ln.opponent), p.nickname]
+                p.player_id, tid if tid != -1 else p.team_id, team_ids.get(team_key(ln.opponent), -1), shown]
     return out
 
 

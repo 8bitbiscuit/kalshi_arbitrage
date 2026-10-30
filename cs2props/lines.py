@@ -67,10 +67,11 @@ def underdog():
         p, g = players[a["player_id"]], games[a["match_id"]]
         away, home = g["full_team_names_title"].split(" vs ", 1)  # title is "AWAY vs HOME"
         team, opp = (home, away) if a["team_id"] == g["home_team_id"] else (away, home)
-        odds = {o["choice"]: float(o["american_price"]) for o in ln.get("options", []) if o.get("american_price")}
+        # No per-pick price: standard pick'em payouts (payout_multiplier 1.0) get the same default breakeven
+        # as PrizePicks. The feed's american_price (-112) is not what a pick'em entry pays.
         yield dict(book="underdog", player=" ".join(x for x in (p.get("first_name"), p.get("last_name")) if x),
-                   team=team, opponent=opp, line=float(ln["stat_value"]), over_odds=odds.get("higher"),
-                   under_odds=odds.get("lower"), start_time=g["scheduled_at"], **market(st["stat"]))
+                   team=team, opponent=opp, line=float(ln["stat_value"]), start_time=g["scheduled_at"],
+                   **market(st["stat"]))
 
 
 def sleeper():
@@ -112,19 +113,23 @@ def pickfinder():
         page = 1
         while True:
             token = driver.get_cookie("__session")["value"]  # short-lived; the open page keeps refreshing it
-            d = http.get("https://api-v2.pickfinder.app/props", timeout=30, headers={"Authorization": f"Bearer {token}"},
-                         params=dict(sport="cs2", page=page, perPage=100)).json()
+            r = http.get("https://api-v2.pickfinder.app/props", timeout=30, headers={"Authorization": f"Bearer {token}"},
+                         params=dict(sport="cs2", page=page, perPage=100))
+            r.raise_for_status()  # a rejected token must fail loudly, not look like "0 lines"
+            d = r.json()
             for it in d.get("items", []):
                 if it.get("isAltLine"):
                     continue
                 for book, app in (it.get("apps") or {}).items():
+                    if book in ("prizepicks", "underdog", "sleeper"):  # already fetched directly
+                        continue
                     out = app.get("outcomes") or {}
                     yield dict(book=book, player=it["player_name"], team=(it.get("team") or {}).get("name"),
                                opponent=(it.get("opponent") or {}).get("name"), line=it["line"],
                                over_odds=(out.get("over") or {}).get("price"),
                                under_odds=(out.get("under") or {}).get("price"),
                                start_time=it.get("start_date"), **market(it["market_id"]))
-            if len(d.get("items", [])) < 100:
+            if page >= d.get("totalPages", 1):
                 break
             page += 1
             time.sleep(1)

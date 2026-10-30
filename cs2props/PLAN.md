@@ -62,7 +62,7 @@ The same things PickFinder shows in the screenshots, built so nothing from the p
 | `hs_pct` | Headshots / kills over the last 20 maps | HS % |
 | `adr_l20`, `kast_l20` | Damage per round, KAST | K/D, rating |
 | `map_factor` | Player's KPR on each map (shrunk toward overall KPR with a 100-round prior), weighted by how often **both teams** played each map in their last 15 maps, divided by overall KPR | Map Picks + per-map Kills/KPR |
-| `win_prob`, `elo_opp` | Map-level Elo built from every bo3.gg result; win probability for the player's team and opponent strength | Moneyline implied win % |
+| `win_prob`, `elo_opp` | Map-level Elo built from every bo3.gg result; win probability for the player's team and opponent strength. A team id seen for the first time (a roster moving org, e.g. LP to BARCA) starts from its players' previous teams' ratings | Moneyline implied win % |
 | `maps_played` | Experience; lets the tree distrust thin histories | sample size |
 
 Why map pool, not actual maps: lines lock before the veto, and bo3.gg has had no veto data since
@@ -83,7 +83,7 @@ way in training and live.
   like √mean, so one z distribution fits 15-kill and 35-kill players alike. Whole-number lines
   (PrizePicks posts 35, 27, ...) get push handling.
 - **Tuning:** `max_depth` 3-10 and `min_samples_leaf` 25-400, chosen on a validation slice by MAE.
-- **Split by time:** oldest 70% train, next 15% validate (tuning and error ratios), newest 15% test.
+- **Split by time:** oldest 70% train, next 15% validate (tuning and the error spread), newest 15% test.
 - **What `train` prints:** test MAE of the tree versus the naive "2 × 20-map average", a stand-in-line
   hit rate (optimistic, since real books are sharper than a 20-map average), Brier score versus a coin
   flip, and the top features.
@@ -95,13 +95,13 @@ Trained on bo3.gg data from July 2025 to October 2026, about 90,000 player-serie
 
 | | Kills, maps 1-2 | Headshots, maps 1-2 |
 |---|---|---|
-| Tree mean absolute error | 6.10 | 3.88 |
+| Tree mean absolute error | 6.09 | 3.87 |
 | Naive "2 × 20-map average" | 6.34 | 3.97 |
-| Brier score on the stand-in line (0.250 = coin flip) | 0.238 | 0.241 |
-| Most important features | kills per round, map factor, win probability, opponent Elo | 20-map headshots, HS% |
+| Brier score on the stand-in line (0.250 = coin flip) | 0.237 | 0.241 |
+| Most important features | kills per round, win probability, map factor, opponent Elo | 20-map headshots, HS% |
 
-On the 2026-10-30 slate (156 lines), projections averaged within 0.06 kills and 0.23 headshots of the
-books' lines (standard deviations 1.7 and 1.3). The model agrees with the books on level, so any edge
+On the 2026-10-30 slate (156 lines), projections averaged within 0.03 kills and 0.21 headshots of the
+books' lines (standard deviations 1.5 and 1.4). The model agrees with the books on level, so any edge
 lives in disagreements of 1-2 kills. That is also why the stand-in hit rate (about 60%) is no guide to
 real profit.
 
@@ -115,7 +115,7 @@ All verified live on 2026-10-30, no login or browser needed:
 | Book | Endpoint | Notes |
 |---|---|---|
 | PrizePicks | `partner-api.prizepicks.com/projections?league_id=265` | Main `api.prizepicks.com` is DataDome-blocked; the partner host is open. Standard lines only (goblin/demon are over-only). No price, so breakeven defaults to 54.3% |
-| Underdog | `api.underdogfantasy.com/v1/over_under_lines?sport_id=CS` | Per-side American prices |
+| Underdog | `api.underdogfantasy.com/v1/over_under_lines?sport_id=CS` | Standard pick'em payout, so the same default breakeven as PrizePicks. The feed's `-112` tag is not what a pick'em entry pays |
 | Sleeper | `api.sleeper.app/lines/available` + `/players/cs` + `/scores/lines_game_picker` | Payout multipliers converted to American odds (1.78 → -128, as in the screenshot) |
 | PickFinder (optional) | `api-v2.pickfinder.app/props?sport=cs2` with the logged-in `__session` token | Replaces the screenshot + OCR. Adds DraftKings Pick6, Dabble, ParlayPlay, ThunderPick, and others. **Untested**, needs your login |
 
@@ -125,9 +125,11 @@ Every scrape is appended to `data/lines_history.csv`.
 
 `predict` keeps the maps 1-2 kills/headshots lines, then matches each to bo3.gg:
 
-- **Teams:** name normalised ("Team Vitality" → "vitality") with fuzzy matching.
-- **Players:** exact name on that team first, then a close name on that team (Sleeper's "MaxOff" is
-  bo3.gg's "max"), then exact name anywhere.
+- **Teams:** exact match after dropping words like Team, Esports, Gaming and CS ("Team Vitality" → "vitality"). Fuzzy team matching was wrong every time it fired in a two-month replay ("PRIVATE" → "Privateer"), so an unknown team stays unknown.
+- **Players:** exact name on that team first, then exact name anywhere (transfers), then a close name
+  on that team (Sleeper's "MaxOff" is bo3.gg's "max"). When the matched player's last team differs
+  from the line's, `matched` shows it, e.g. "pr (MOUZ)", because a namesake on another team is the one
+  mis-join names alone can't rule out.
 - **Features:** computed as of the line's start time.
 - **Unmatched opponents:** a line whose opponent can't be matched gets NO DATA rather than being
   scored against an average team.
@@ -176,6 +178,13 @@ Next steps, in order of value:
   - HLTV bans scraping.
   - Automated use of the DFS apps and PickFinder may breach their terms.
   - Keep request rates low (the code waits about 1 s per request) and use this for personal research.
+
+## Breakeven for pick'em apps
+
+PrizePicks and Underdog pay per entry, not per pick, so `DEFAULT_ODDS` in `model.py` (-119, i.e. 54.3%
+per pick, about a 5/6-pick flex entry) sets their breakeven. Change it to match how you play: a 2-pick
+power play paying 3x needs about 57.7% per pick (`DEFAULT_ODDS = -137`). Sleeper's per-pick multipliers
+and PickFinder's sportsbook prices are used as given.
 
 ## Credentials
 

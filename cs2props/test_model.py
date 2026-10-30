@@ -42,6 +42,10 @@ def test_elo_probabilities_and_parsing():
     df = fake_maps(400)
     s = model.features(model.series(df), df)
     assert s[(s.match_id > 300) & (s.team_id == 0)].win_prob.mean() > 0.7
+    later = df.match_id >= 300  # Alpha's five move to a new org (team id 9): the rating should follow them
+    moved = df.assign(team_id=df.team_id.mask(later & (df.team_id == 0), 9), opp_id=df.opp_id.mask(later & (df.opp_id == 0), 9))
+    s9 = model.features(model.series(moved), moved).query("team_id == 9")
+    assert s9.win_prob.iloc[0] > 0.7
     over, under = model.probs([30.0, 30.0, 30.0], [30.5, 30.5, 30.0], np.array([-1.0, 0.0, 1.0]))
     assert np.allclose(over, [1 / 3] * 3) and np.allclose(under, [2 / 3, 2 / 3, 1 / 3])  # 30.0 line: push 1/3
     assert round(model.american_to_prob(-115), 4) == 0.5349
@@ -75,6 +79,8 @@ def test_train_then_predict(tmp_path, monkeypatch):
              line=25.5, over_odds=-112, under_odds=-112, start_time=when),
         dict(book="a", player="p7", team="Bravo", opponent="Charlie", stat="kills", maps="1-3", line=45.5, start_time=when),
         dict(book="a", player="nobody", team="X", opponent="Y", stat="kills", maps="1-2", line=30.5, start_time=when),
+        # exact name on another team beats a close name on this team ("p10" is on Charlie)
+        dict(book="a", player="p1", team="Charlie", opponent="Delta", stat="kills", maps="1-2", line=20.5, start_time=when),
     ]).to_csv("data/lines.csv", index=False)
     model.predict()
     picks = pd.read_csv("data/picks.csv").set_index(["player", "stat"])
@@ -82,4 +88,5 @@ def test_train_then_predict(tmp_path, monkeypatch):
     assert picks.loc[("MaxOff", "kills"), "pick"] == "OVER"         # ~40 expected vs 30.5
     assert picks.loc[("maxoff", "headshots"), "pick"] == "UNDER"    # ~20 expected vs 25.5
     assert picks.loc[("nobody", "kills"), "pick"] == "NO DATA"
+    assert picks.loc[("p1", "kills"), "matched"] == "p1 (Alpha Gaming)"
     assert ("p7", "kills") not in picks.index                        # maps 1-3 is not modelled
