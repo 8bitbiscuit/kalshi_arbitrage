@@ -15,7 +15,7 @@ DFS / PickFinder ──lines.py──▶ data/lines.csv ──model.py predict�
 
 ```bash
 pip install -r cs2props/requirements.txt
-python -m cs2props.history          # first run ~1-2 h (everything since CS2 launch); later runs take minutes
+python -m cs2props.history          # first run about 1 hour (all of CS2); later runs take a minute
 python -m cs2props.model train      # prints honest test metrics, saves the two trees
 python -m cs2props.lines            # current lines from PrizePicks, Underdog, Sleeper (no login)
 python -m cs2props.model predict    # prints and saves picks, best edge first
@@ -40,9 +40,16 @@ player per map goes to `data/maps.csv`.
 Checked against real settlement: Sleeper's own "last 10 results" for 165 player-matches equalled the
 bo3.gg sum over maps 1 and 2 exactly, overtime included.
 
-Gotchas the code already handles: games come back in reverse order (sorted by `number`), the nested
-`player.team_id` is today's team (the row-level `team_id` is used instead), `game_version` filtering
-must be done client-side, and box scores can appear a day late (each run re-checks the last two days).
+Data problems found in the real download, and how the code handles them:
+
+| Problem | How common | Handling |
+|---|---|---|
+| Rows with no headshots/ADR/KAST are partial live snapshots, so kills run about 20% low (5.45 vs 6.68 total kills per round). Example: one map with 10 kills in total here vs 137 in the full scoreboard | About 20% of maps before March 2026, none since | Dropped. A new match is only saved once every map is complete |
+| Headshots larger than kills (values like 810) | 31 maps on 2025-10-27/28 | Map dropped |
+| Fewer than 13 rounds (forfeit or abandoned) | About 110 maps | Map dropped |
+| Rows with no player id | 36 rows | Dropped |
+| Map order in `games[]` is reversed, and the nested `player.team_id` is today's team | Always | Sorted by `number`; the row-level `team_id` is used |
+| Box scores arrive late | Common for fresh matches | Each run re-checks the last two days |
 
 ## 2. Features (all computed strictly before the match starts)
 
@@ -70,14 +77,36 @@ way in training and live.
 
 - **Target:** maps 1-2 kills (and a second tree for headshots), for every player in every BO3/BO5 that
   reached map 2. A *regression* tree, because there are no historical lines to label over/under.
-- **Over/under probability:** P(over 30.5) = share of held-out results where
-  `projection × (actual / predicted)` lands above 30.5. Whole-number lines (PrizePicks posts 35, 27, ...)
-  get push handling.
+- **Over/under probability:** each validation result gives a held-out error `z = (actual − predicted) / √predicted`.
+  The z values are centred so a level shift between periods doesn't bias every pick. P(over 30.5) is
+  the share of z values for which `projection + z·√projection` lands above 30.5. Counting stats spread
+  like √mean, so one z distribution fits 15-kill and 35-kill players alike. Whole-number lines
+  (PrizePicks posts 35, 27, ...) get push handling.
 - **Tuning:** `max_depth` 3-10 and `min_samples_leaf` 25-400, chosen on a validation slice by MAE.
 - **Split by time:** oldest 70% train, next 15% validate (tuning and error ratios), newest 15% test.
 - **What `train` prints:** test MAE of the tree versus the naive "2 × 20-map average", a stand-in-line
   hit rate (optimistic, since real books are sharper than a 20-map average), Brier score versus a coin
   flip, and the top features.
+
+### Results on real data
+
+Trained on bo3.gg data from July 2025 to October 2026, about 90,000 player-series. Tested on the newest
+15% (2026-09-16 to 2026-10-30), which the model never saw:
+
+| | Kills, maps 1-2 | Headshots, maps 1-2 |
+|---|---|---|
+| Tree mean absolute error | 6.10 | 3.88 |
+| Naive "2 × 20-map average" | 6.34 | 3.97 |
+| Brier score on the stand-in line (0.250 = coin flip) | 0.238 | 0.241 |
+| Most important features | kills per round, map factor, win probability, opponent Elo | 20-map headshots, HS% |
+
+On the 2026-10-30 slate (156 lines), projections averaged within 0.06 kills and 0.23 headshots of the
+books' lines (standard deviations 1.7 and 1.3). The model agrees with the books on level, so any edge
+lives in disagreements of 1-2 kills. That is also why the stand-in hit rate (about 60%) is no guide to
+real profit.
+
+A single tree also gives every player in the same leaf an identical projection. Gradient boosting
+(next steps) removes that coarseness.
 
 ## 4. Current lines
 
@@ -100,6 +129,8 @@ Every scrape is appended to `data/lines_history.csv`.
 - **Players:** exact name on that team first, then a close name on that team (Sleeper's "MaxOff" is
   bo3.gg's "max"), then exact name anywhere.
 - **Features:** computed as of the line's start time.
+- **Unmatched opponents:** a line whose opponent can't be matched gets NO DATA rather than being
+  scored against an average team.
 
 The output is sorted by edge:
 

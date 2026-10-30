@@ -27,13 +27,16 @@ http.headers["User-Agent"] = "cs2props/0.1 (personal research; ~1 request/s)"
 def get(**params):
     for attempt in range(6):
         time.sleep(1)  # be polite
-        r = http.get(API, params=params, timeout=120)
-        if r.status_code == 200:
-            return r.json()
-        if r.status_code not in (429, 500, 502, 503, 504):
-            r.raise_for_status()
+        try:
+            r = http.get(API, params=params, timeout=120)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code not in (429, 500, 502, 503, 504):
+                r.raise_for_status()
+        except (requests.ConnectionError, requests.Timeout, ValueError) as e:  # dropped / truncated response
+            print(f"retrying after {e!r}")
         time.sleep(5 * 2 ** attempt)
-    r.raise_for_status()
+    raise RuntimeError("bo3.gg kept failing; re-run later, the download resumes")
 
 
 def rows(m):
@@ -43,10 +46,11 @@ def rows(m):
     seen = set()
     for p in m.get("game_players") or []:
         g = games.get(p["game_id"])
-        if not g or p["team_id"] not in teams or (g["id"], p["player_id"]) in seen:
+        if not g or p.get("player_id") is None or p["team_id"] not in teams or (g["id"], p["player_id"]) in seen:
             continue
         seen.add((g["id"], p["player_id"]))
         winner = (g.get("winner_team_clan") or {}).get("team_id")
+        winner = winner if winner in teams else None
         score = (g.get("winner_clan_score") or 0) + (g.get("loser_clan_score") or 0)
         yield dict(match_id=m["id"], start_date=m["start_date"], tier=m.get("tier"), bo_type=m["bo_type"],
                    game_id=g["id"], map_number=g["number"], map_name=g["map_name"],
@@ -62,6 +66,9 @@ def main(since=None):
     os.makedirs("data", exist_ok=True)
     done, newest = set(), CS2_LAUNCH
     if os.path.exists(OUT):
+        with open(OUT, "rb+") as f:  # a killed run can leave half a row: cut back to the last full line
+            data = f.read()
+            f.truncate(data.rfind(b"\n") + 1)
         with open(OUT) as f:
             for r in csv.DictReader(f):
                 done.add(int(r["match_id"]))
@@ -78,10 +85,13 @@ def main(since=None):
                           "filter[matches.status][in]": "finished", "filter[matches.discipline_id][eq]": 1,
                           "filter[matches.start_date][gt]": since})
             for m in page["results"]:
-                if m["id"] in done or m.get("game_version") != 2 or None in (m.get("team1_id"), m.get("team2_id")):
+                if (m["id"] in done or m.get("game_version") != 2 or None in (m.get("team1_id"), m.get("team2_id"))
+                        or m["team1_id"] == m["team2_id"]):
                     continue
                 new = list(rows(m))
-                if new:  # matches without box scores yet are retried on the next run
+                # Rows without headshots are partial live snapshots (kills ~20% low). Wait for the full box
+                # score; the next run re-checks the last two days.
+                if new and all(r["headshots"] is not None for r in new):
                     out.writerows(new)
                     done.add(m["id"])
             f.flush()

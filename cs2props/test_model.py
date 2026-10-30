@@ -42,13 +42,24 @@ def test_elo_probabilities_and_parsing():
     df = fake_maps(400)
     s = model.features(model.series(df), df)
     assert s[(s.match_id > 300) & (s.team_id == 0)].win_prob.mean() > 0.7
-    over, under = model.probs([30.0, 30.0, 30.0], [30.5, 30.5, 30.0], np.array([0.9, 1.0, 1.1]))
+    over, under = model.probs([30.0, 30.0, 30.0], [30.5, 30.5, 30.0], np.array([-1.0, 0.0, 1.0]))
     assert np.allclose(over, [1 / 3] * 3) and np.allclose(under, [2 / 3, 2 / 3, 1 / 3])  # 30.0 line: push 1/3
     assert round(model.american_to_prob(-115), 4) == 0.5349
     assert lines.market("MAPS 1-2 Kills") == lines.market("kills_on_maps_1_2") == {"stat": "kills", "maps": "1-2"}
     assert lines.market("1st_3_maps_player_headshots") == {"stat": "headshots", "maps": "1-3"}
     assert lines.market("2nd_map_player_kills") == {"stat": "kills", "maps": "2"}
     assert lines.american(1.78) == -128 and lines.american(2.5) == 150
+
+
+def test_load_drops_incomplete_box_scores(tmp_path):
+    df = fake_maps(3)
+    df.loc[df.game_id == 1, "headshots"] = np.nan  # partial live snapshot
+    df.loc[df.game_id == 2, "headshots"] = 999     # glitch: more headshots than kills
+    df.loc[df.game_id == 3, "rounds"] = 5          # forfeit
+    df.to_csv(tmp_path / "maps.csv", index=False)
+    kept = model.load(tmp_path / "maps.csv")
+    assert set(kept.game_id) == set(df.game_id) - {1, 2, 3}
+    assert model.series(kept).match_id.tolist().count(0) == 0  # match 0 lost maps 1-2, so no label
 
 
 def test_train_then_predict(tmp_path, monkeypatch):
