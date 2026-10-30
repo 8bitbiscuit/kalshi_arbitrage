@@ -2,6 +2,7 @@
 
     python -m cs2props.model train     # data/maps.csv  -> data/model_{kills,headshots}.joblib
     python -m cs2props.model predict   # data/lines.csv -> data/picks.csv
+    python -m cs2props.model backtest [data/prop_history.csv | data/lines_history.csv]
 
 The tree predicts the stat itself (e.g. maps 1-2 kills). There are no historical prop lines to label
 "over/under" with, so P(over line) comes from the tree's projection plus the spread of its held-out errors.
@@ -18,6 +19,7 @@ import pandas as pd
 from sklearn.tree import DecisionTreeRegressor
 
 MAPS_CSV, LINES_CSV, PICKS_CSV = "data/maps.csv", "data/lines.csv", "data/picks.csv"
+PROPS_CSV, BACKTEST_CSV = "data/prop_history.csv", "data/backtest.csv"
 STATS = ("kills", "headshots")
 FEATURES = ["kills_l20", "kills_l5", "headshots_l20", "hs_pct", "kpr", "adr_l20", "kast_l20", "rounds_l20",
             "maps_played", "map_factor", "win_prob", "elo_opp"]
@@ -133,17 +135,14 @@ def fit(X, y, depth, leaf):
     return DecisionTreeRegressor(max_depth=depth, min_samples_leaf=leaf, random_state=0).fit(X, y)
 
 
-def train(maps_csv=MAPS_CSV):
-    df = load(maps_csv)
-    feats = features(series(df), df)
-    be = american_to_prob(DEFAULT_ODDS)
+def fit_models(feats, verbose=True):
+    """Per stat: tune on a time split, report on the newest 15%, refit on the rest. Returns {stat: bundle}."""
+    be, bundles = american_to_prob(DEFAULT_ODDS), {}
     for stat in STATS:
         y = f"{stat}_m12"
         s = feats.dropna(subset=NEED[stat] + [y])
         n = len(s)
         tr, va, te = s[: int(0.7 * n)], s[int(0.7 * n): int(0.85 * n)], s[int(0.85 * n):]
-        print(f"\n{stat}: {n} player-series | train {len(tr)} | validate {len(va)} | test {len(te)} "
-              f"({te.start_date.iloc[0]:%Y-%m-%d} to {te.start_date.iloc[-1]:%Y-%m-%d})")
 
         def mae(m, d):
             return np.abs(m.predict(d[FEATURES]) - d[y]).mean()
@@ -155,24 +154,32 @@ def train(maps_csv=MAPS_CSV):
         z = ((va[y] - p) / np.sqrt(p)).to_numpy()
         z = z - z.mean()  # keep the spread, drop any level shift between the train and validation periods
 
-        # Honest check on the untouched last 15%: does the tree beat "2 x 20-map average"?
-        pred, base, actual = model.predict(te[FEATURES]), 2 * te[f"{stat}_l20"].to_numpy(), te[y].to_numpy()
-        line = np.floor(base) + 0.5  # stand-in line; real books are sharper than this
-        po, pu = probs(pred, line, z)
-        bet_o, bet_u = po > be, pu > be
-        hits = (actual[bet_o] > line[bet_o]).sum() + (actual[bet_u] < line[bet_u]).sum()
-        bets = bet_o.sum() + bet_u.sum()
-        print(f"   depth={depth} leaf={leaf} | test MAE: tree {np.abs(pred - actual).mean():.2f} vs "
-              f"2 x 20-map avg {np.abs(base - actual).mean():.2f}\n"
-              f"   stand-in-line bets {bets}/{len(te)}, hit {hits / max(bets, 1):.1%} (breakeven {be:.1%}; "
-              f"optimistic, real lines are sharper) | Brier {np.mean((po - (actual > line)) ** 2):.3f} vs 0.250")
-        top = sorted(zip(model.feature_importances_, FEATURES), reverse=True)[:5]
-        print("   top features: " + ", ".join(f"{name} {imp:.2f}" for imp, name in top))
+        if verbose:  # honest check on the untouched last 15%: does the tree beat "2 x 20-map average"?
+            pred, base, actual = model.predict(te[FEATURES]), 2 * te[f"{stat}_l20"].to_numpy(), te[y].to_numpy()
+            line = np.floor(base) + 0.5  # stand-in line; real books are sharper than this
+            po, pu = probs(pred, line, z)
+            bet_o, bet_u = po > be, pu > be
+            hits = (actual[bet_o] > line[bet_o]).sum() + (actual[bet_u] < line[bet_u]).sum()
+            bets = bet_o.sum() + bet_u.sum()
+            print(f"\n{stat}: {n} player-series | train {len(tr)} | validate {len(va)} | test {len(te)} "
+                  f"({te.start_date.iloc[0]:%Y-%m-%d} to {te.start_date.iloc[-1]:%Y-%m-%d})\n"
+                  f"   depth={depth} leaf={leaf} | test MAE: tree {np.abs(pred - actual).mean():.2f} vs "
+                  f"2 x 20-map avg {np.abs(base - actual).mean():.2f}\n"
+                  f"   stand-in-line bets {bets}/{len(te)}, hit {hits / max(bets, 1):.1%} (breakeven {be:.1%}; "
+                  f"optimistic, real lines are sharper) | Brier {np.mean((po - (actual > line)) ** 2):.3f} vs 0.250")
+            top = sorted(zip(model.feature_importances_, FEATURES), reverse=True)[:5]
+            print("   top features: " + ", ".join(f"{name} {imp:.2f}" for imp, name in top))
 
         # ponytail: z comes from the 70%-data model, so production intervals are slightly wide.
         both = pd.concat([tr, va])
-        joblib.dump({"model": fit(both[FEATURES], both[y], depth, leaf), "z": np.sort(z)},
-                    f"data/model_{stat}.joblib")
+        bundles[stat] = {"model": fit(both[FEATURES], both[y], depth, leaf), "z": np.sort(z)}
+    return bundles
+
+
+def train(maps_csv=MAPS_CSV):
+    df = load(maps_csv)
+    for stat, bundle in fit_models(features(series(df), df)).items():
+        joblib.dump(bundle, f"data/model_{stat}.joblib")
     print("saved data/model_kills.joblib, data/model_headshots.joblib")
 
 
@@ -211,9 +218,8 @@ def resolve(lines, df):
     return out
 
 
-def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
-    df = load(maps_csv)
-    lines = pd.read_csv(lines_csv)
+def score(lines, df, bundles):
+    """Projection, P(over/under), edge and pick for maps 1-2 kill/headshot lines (start_time = as-of time)."""
     lines = lines[lines.stat.isin(STATS) & (lines.maps.astype(str) == "1-2")].reset_index(drop=True)
     lines["start_date"] = pd.to_datetime(lines.start_time, utc=True, format="ISO8601").fillna(pd.Timestamp.now(tz="UTC"))
     lines = resolve(lines, df).reset_index(names="line_idx")
@@ -222,23 +228,102 @@ def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
     f = features(known[["line_idx", "player_id", "team_id", "opp_id", "start_date"]], df)
     out = lines.merge(f[["line_idx"] + FEATURES], on="line_idx", how="left")
     out["proj"] = out["p_over"] = out["p_under"] = np.nan
-    for stat in STATS:
-        bundle = joblib.load(f"data/model_{stat}.joblib")
+    for stat, bundle in bundles.items():
         m = (out.stat == stat) & out[NEED[stat]].notna().all(axis=1)
         if m.any():
             out.loc[m, "proj"] = bundle["model"].predict(out.loc[m, FEATURES])
             out.loc[m, "p_over"], out.loc[m, "p_under"] = probs(out.loc[m, "proj"], out.loc[m, "line"], bundle["z"])
-    be_over = out.get("over_odds", pd.Series(np.nan, index=out.index)).fillna(DEFAULT_ODDS).map(american_to_prob)
-    be_under = out.get("under_odds", pd.Series(np.nan, index=out.index)).fillna(DEFAULT_ODDS).map(american_to_prob)
+    for side in ("over", "under"):
+        odds = out[f"{side}_odds"] if f"{side}_odds" in out else pd.Series(np.nan, index=out.index)
+        out[f"{side}_odds"] = pd.to_numeric(odds, errors="coerce").fillna(DEFAULT_ODDS)
+    be_over, be_under = out.over_odds.map(american_to_prob), out.under_odds.map(american_to_prob)
     out["edge"] = np.maximum(out.p_over - be_over, out.p_under - be_under)
     out["pick"] = np.select([out.p_over.isna(), out.p_over > be_over, out.p_under > be_under],
                             ["NO DATA", "OVER", "UNDER"], "PASS")
-    out = out.sort_values("edge", ascending=False)
+    return out
+
+
+def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
+    df = load(maps_csv)
+    bundles = {stat: joblib.load(f"data/model_{stat}.joblib") for stat in STATS}
+    out = score(pd.read_csv(lines_csv), df, bundles).sort_values("edge", ascending=False)
     cols = ["book", "player", "matched", "team", "opponent", "stat", "line", "proj", "p_over", "p_under", "edge", "pick"]
     out.to_csv(PICKS_CSV, index=False)
     print(out[[c for c in cols if c in out]].round(3).to_string(index=False))
     print(f"\n{(out.pick == 'NO DATA').sum()} of {len(out)} lines had no usable history (check 'matched').")
 
 
+def profit(odds):
+    """Profit per 1 unit staked at American odds when the pick wins."""
+    return np.where(odds > 0, odds / 100, 100 / np.abs(odds))
+
+
+def backtest(props_csv=PROPS_CSV, maps_csv=MAPS_CSV):
+    """Grade the model on real past lines (PickFinder prop history, or data/lines_history.csv).
+
+    Models are refit only on matches before the first graded line, and features are as of each
+    line's start time, so nothing the bettor couldn't have known leaks in.
+    """
+    df = load(maps_csv)
+    props = pd.read_csv(props_csv)
+    if "scraped_at" in props:  # our own archive: keep each line's last snapshot before the match (closing line)
+        props = props[pd.to_datetime(props.scraped_at, utc=True, format="ISO8601")
+                      <= pd.to_datetime(props.start_time, utc=True, format="ISO8601")]
+        props = props.sort_values("scraped_at").drop_duplicates(["book", "player", "stat", "maps", "start_time"], keep="last")
+    feats = features(series(df), df)
+    cutoff = pd.to_datetime(props.start_time, utc=True, format="ISO8601").min()
+    # ponytail: one cutoff; a monthly walk-forward refit would use more training data for later lines.
+    bundles = fit_models(feats[feats.start_date < cutoff], verbose=False)
+    out = score(props, df, bundles)
+
+    # Result from bo3.gg: the player's maps 1-2 total vs the same opponent, starting within 12 h of the line.
+    res = series(df)[["player_id", "opp_id", "start_date", "kills_m12", "headshots_m12"]]
+    res = res.rename(columns={"start_date": "match_start"}).astype({"player_id": float, "opp_id": int})
+    out = pd.merge_asof(out.sort_values("start_date"), res.sort_values("match_start"), left_on="start_date",
+                        right_on="match_start", by=["player_id", "opp_id"], direction="nearest",
+                        tolerance=pd.Timedelta(hours=12))
+    bo3 = np.where(out.stat == "kills", out.kills_m12, out.headshots_m12)
+    if "actual" in out:
+        both = out.actual.notna() & pd.notna(bo3)
+        print(f"actual results: source file agrees with bo3.gg on {(out.actual[both] == bo3[both]).mean():.1%} "
+              f"of {both.sum()} lines")
+        out["actual"] = out.actual.fillna(pd.Series(bo3, index=out.index))
+    else:
+        out["actual"] = bo3
+    out = out[out.actual.notna() & out.p_over.notna()].copy()
+    if out.empty:
+        return print("no gradable lines yet: their matches have no bo3.gg result (run history first) or no "
+                     "usable player history")
+    out["result"] = np.select([out.actual > out.line, out.actual < out.line], ["OVER", "UNDER"], "PUSH")
+    bet = out[out.pick.isin(["OVER", "UNDER"])].copy()
+    odds = np.where(bet.pick == "OVER", bet.over_odds, bet.under_odds)
+    bet["units"] = np.select([bet.result == bet.pick, bet.result == "PUSH"], [profit(odds), 0.0], -1.0)
+    bet["breakeven"] = pd.Series(odds, index=bet.index).map(american_to_prob)
+    bet["won"], bet["push"] = bet.result == bet.pick, bet.result == "PUSH"
+    out.merge(bet[["units"]], left_index=True, right_index=True, how="left").to_csv(BACKTEST_CSV, index=False)
+
+    def summary(g):
+        decided = g[~g.push]
+        hit = decided.won.mean() if len(decided) else np.nan
+        ci = 1.96 * np.sqrt(hit * (1 - hit) / max(len(decided), 1))
+        return pd.Series({"bets": len(g), "hit": hit, "+/-95%": ci, "breakeven": g.breakeven.mean(),
+                          "units": g.units.sum(), "roi": g.units.sum() / max(len(g), 1)})
+
+    print(f"\n{len(out)} graded lines from {out.start_date.min():%Y-%m-%d} to {out.start_date.max():%Y-%m-%d} "
+          f"(models trained on matches before {cutoff:%Y-%m-%d}); {len(bet)} bets, {(out.result == 'PUSH').sum()} pushes")
+    print("\nAll bets:\n" + summary(bet).round(3).to_string())
+    bet["edge_bucket"] = pd.cut(bet.edge, [0, 0.05, 0.10, 1], labels=["0-5%", "5-10%", "10%+"])
+    for col in ("edge_bucket", "stat", "pick", "book"):
+        print(f"\nBy {col}:\n" + bet.groupby(col, observed=True).apply(summary, include_groups=False).round(3).to_string())
+    over_rate = (out.result == "OVER")[out.result != "PUSH"].mean()
+    print(f"\nBaselines: always OVER hits {over_rate:.1%}, always UNDER hits {1 - over_rate:.1%}")
+    cal = out[out.result != "PUSH"].assign(bin=lambda d: pd.cut(d.p_over, [0, .3, .4, .5, .6, .7, 1]))
+    print("\nCalibration (predicted P(over) vs actual over rate):\n" + cal.groupby("bin", observed=True).agg(
+        lines=("p_over", "size"), predicted=("p_over", "mean"),
+        actual=("result", lambda r: (r == "OVER").mean())).round(3).to_string())
+    print(f"\nper-line results saved to {BACKTEST_CSV}")
+
+
 if __name__ == "__main__":
-    {"train": train, "predict": predict}[sys.argv[1] if len(sys.argv) > 1 else "train"]()
+    cmd, *args = sys.argv[1:] or ["train"]
+    {"train": train, "predict": predict, "backtest": backtest}[cmd](*args)

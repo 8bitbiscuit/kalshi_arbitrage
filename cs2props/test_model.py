@@ -1,4 +1,6 @@
 """python -m pytest cs2props -q"""
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -90,3 +92,26 @@ def test_train_then_predict(tmp_path, monkeypatch):
     assert picks.loc[("nobody", "kills"), "pick"] == "NO DATA"
     assert picks.loc[("p1", "kills"), "matched"] == "p1 (Alpha Gaming)"
     assert ("p7", "kills") not in picks.index                        # maps 1-3 is not modelled
+
+
+def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    df = fake_maps(400)
+    df.to_csv("data/maps.csv", index=False)
+    s = model.series(df)
+    late = s[(s.match_id >= 300) & s.player_id.isin([0, 7])]  # 'max' averages ~40, 'p7' ~30
+    names = dict(enumerate(TEAMS))
+    pd.DataFrame(dict(book="pf", player=late.player_id.map({0: "max", 7: "p7"}), team=late.team_id.map(names),
+                      opponent=late.opp_id.map(names), stat="kills", maps="1-2",
+                      line=late.player_id.map({0: 30.5, 7: 36.5}), over_odds=-115, under_odds=-115,
+                      start_time=late.start_date.dt.strftime("%Y-%m-%dT%H:%M:%SZ"), actual=late.kills_m12)
+                 ).to_csv("data/prop_history.csv", index=False)
+    model.backtest()
+    agree = re.search(r"agrees with bo3.gg on ([\d.]+)%", capsys.readouterr().out)
+    assert float(agree.group(1)) >= 95  # not 100: a map can fail load()'s sanity checks
+    bt = pd.read_csv("data/backtest.csv")
+    assert len(bt) == len(late)
+    assert (bt[bt.player == "max"].pick == "OVER").mean() > 0.9
+    assert (bt[bt.player == "p7"].pick == "UNDER").mean() > 0.9
+    assert bt.units.sum() > 0
