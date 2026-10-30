@@ -8,7 +8,8 @@ decision tree trained on CS2 match history.
 bo3.gg API ──history.py──▶ data/maps.csv ──model.py train──▶ data/model_*.joblib
                                                               │
 DFS / PickFinder ──lines.py──▶ data/lines.csv ──model.py predict──▶ data/picks.csv
-                         └──▶ data/lines_history.csv  (archive for grading real-line accuracy later)
+                         └──▶ data/lines_history.csv ─┐
+PickFinder history ──pickfinder.py──▶ data/prop_history.csv ─┴─model.py backtest──▶ data/backtest.csv
 ```
 
 ## Run it
@@ -19,6 +20,8 @@ python -m cs2props.history          # first run about 1 hour (all of CS2); later
 python -m cs2props.model train      # prints honest test metrics, saves the two trees
 python -m cs2props.lines            # current lines from PrizePicks, Underdog, Sleeper (no login)
 python -m cs2props.model predict    # prints and saves picks, best edge first
+python -m cs2props.pickfinder history            # past lines + results from PickFinder (your login)
+python -m cs2props.model backtest                # grade the model on them (or: backtest data/lines_history.csv)
 python -m pytest cs2props -q        # self-checks (leakage, probabilities, name matching, end to end)
 ```
 
@@ -144,20 +147,51 @@ The output is sorted by edge:
 | `edge` | Probability minus the breakeven implied by the price |
 | `pick` | OVER / UNDER / PASS / NO DATA |
 
-## 6. How to know whether it works
+## 6. How to know whether it works: backtest on real past lines
 
-The stand-in backtest can't prove an edge against real books, because no historical prop lines exist anywhere
-reachable. The real test starts now:
+The stand-in check in `train` can't prove an edge against real books. Only real past lines can, and there
+are two sources:
 
-1. Run `lines` at least daily (more often near match times) so `lines_history.csv` builds up.
-2. After about 2-3 weeks (several hundred graded lines), grade each archived pick against the bo3.gg
-   result and compare the hit rate on picks with `edge > 0` to the breakeven.
-3. Only trust the picks if that real hit rate beats the breakeven by more than the sampling noise.
-   At 500 picks, ±4.5 points is the 95% band.
+| Source | Command | What it gives |
+|---|---|---|
+| PickFinder prop history (about 6 months, main lines only) | `python -m cs2props.pickfinder history` | `data/prop_history.csv`: past lines and results for every player with a prop up today. Run it on several days to cover more players |
+| Our own archive | every `lines` run appends to `data/lines_history.csv` | Exact closing lines and prices from PrizePicks, Underdog and Sleeper, from now on |
+
+`python -m cs2props.model backtest [csv]` then grades the model on those lines:
+
+- **No look-ahead:** the trees are refit on matches *before* the first graded line, and every feature is
+  computed as of each line's start time.
+- **Results** come from the file and are cross-checked against bo3.gg. It prints the agreement rate, and
+  bo3.gg fills any missing result.
+- **The report** covers:
+  - hit rate with its 95% band, versus breakeven
+  - units won and ROI at each line's own price
+  - all of that split by edge bucket, stat, OVER/UNDER and book
+  - "always over / always under" baselines
+  - a calibration table (predicted P(over) vs actual)
+- **Per-line results** go to `data/backtest.csv`.
+
+Only trust the picks if the hit rate beats breakeven by more than the band. At 500 bets the band is
+about ±4.5 points, so a 58% hit rate at a 54.3% breakeven is not yet proof.
+
+**PickFinder status.** The scraper is untested because it needs your login. PickFinder's public code
+confirms where the results are: per-player game logs with per-map kills and headshots. Parsing a real
+log reproduces your screenshot's results (KaiR0N: 30 kills vs Vitality on 10/30, 29 vs FUT on 10/29).
+The code also shows lines being archived per game ("lines are archived from this season on") under the
+market names "Maps 1-2 Kills" and "Maps 1-2 HS". But the request behind the CS2 Prop History panel is in
+code that only loads after login. The game log fetched without a login had no lines.
+
+`history` checks the two likely places: the game log's `lines` and past items from `/players/{id}/props`. It
+saves one raw example of each response to `data/pickfinder_debug/`. If it finds no past lines, run
+`python -m cs2props.pickfinder discover KaiR0N`. That opens the player page, lets you click Prop History,
+and saves every API response the page made. One of those holds the lines, and adapting `player_rows()` to
+it is a small change.
+
+Scraping many player histories is heavier use than the app's own pages make. The code waits 1 s per
+request, but check PickFinder's terms before running it often.
 
 Next steps, in order of value:
 
-- **A grading script.** Add it once lines have been archived for about two weeks.
 - **A classifier trained on real lines.** Once a few thousand graded lines exist, train it on
   `(features, line) → over?`.
 - **A stronger model.** Swap `DecisionTreeRegressor` for `HistGradientBoostingRegressor`. It is a

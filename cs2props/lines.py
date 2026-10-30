@@ -94,47 +94,21 @@ def sleeper():
 
 
 def pickfinder():
-    # ponytail: untested end to end (needs a PickFinder login); API shape read from the site's JS bundle.
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.support.ui import WebDriverWait
+    from cs2props.pickfinder import current_props, session  # Selenium login; see pickfinder.py
 
-    driver = webdriver.Firefox()
-    try:
-        wait = WebDriverWait(driver, 20)
-        driver.get("https://www.pickfinder.app/props")
-        wait.until(EC.presence_of_element_located((By.NAME, "identifier"))).send_keys(
-            os.environ["PICKFINDER_EMAIL"], Keys.ENTER)
-        wait.until(EC.element_to_be_clickable((By.NAME, "password"))).send_keys(
-            os.environ["PICKFINDER_PASSWORD"], Keys.ENTER)
-        wait.until(lambda d: d.get_cookie("__session"))
-        page = 1
-        while True:
-            token = driver.get_cookie("__session")["value"]  # short-lived; the open page keeps refreshing it
-            r = http.get("https://api-v2.pickfinder.app/props", timeout=30, headers={"Authorization": f"Bearer {token}"},
-                         params=dict(sport="cs2", page=page, perPage=100))
-            r.raise_for_status()  # a rejected token must fail loudly, not look like "0 lines"
-            d = r.json()
-            for it in d.get("items", []):
-                if it.get("isAltLine"):
+    with session() as get:
+        for it in current_props(get):
+            if it.get("isAltLine"):
+                continue
+            for book, app in (it.get("apps") or {}).items():
+                if book in ("prizepicks", "underdog", "sleeper"):  # already fetched directly
                     continue
-                for book, app in (it.get("apps") or {}).items():
-                    if book in ("prizepicks", "underdog", "sleeper"):  # already fetched directly
-                        continue
-                    out = app.get("outcomes") or {}
-                    yield dict(book=book, player=it["player_name"], team=(it.get("team") or {}).get("name"),
-                               opponent=(it.get("opponent") or {}).get("name"), line=it["line"],
-                               over_odds=(out.get("over") or {}).get("price"),
-                               under_odds=(out.get("under") or {}).get("price"),
-                               start_time=it.get("start_date"), **market(it["market_id"]))
-            if page >= d.get("totalPages", 1):
-                break
-            page += 1
-            time.sleep(1)
-    finally:
-        driver.quit()
+                out = app.get("outcomes") or {}
+                yield dict(book=book, player=it["player_name"], team=(it.get("team") or {}).get("name"),
+                           opponent=(it.get("opponent") or {}).get("name"), line=it["line"],
+                           over_odds=(out.get("over") or {}).get("price"),
+                           under_odds=(out.get("under") or {}).get("price"),
+                           start_time=it.get("start_date"), **market(it["market_id"]))
 
 
 def main():

@@ -115,3 +115,19 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
     assert (bt[bt.player == "max"].pick == "OVER").mean() > 0.9
     assert (bt[bt.player == "p7"].pick == "UNDER").mean() > 0.9
     assert bt.units.sum() > 0
+
+
+def test_pickfinder_history_rows():
+    from cs2props import pickfinder
+    games = [dict(startTime="2025-10-30 12:02:35.000Z", vs="Vitality", vsAbbr="VIT", lines={"Maps 1-2 Kills": 27.5},
+                  periodStats=[dict(kills=17, headshots=11), dict(kills=13, headshots=7)]),
+             dict(startTime="2025-10-28 12:00:00.000Z", vs="Bo1 side", vsAbbr="X", periodStats=[dict(kills=20, headshots=9)])]
+    props = [dict(stat="Maps 1-2 HS", line=17.5, start_date="2025-10-30T11:00:00Z",  # abbreviation differs from gamelog
+                  opponent=dict(name="Team Vitality", abbreviation="VITALITY"),
+                  apps=dict(prizepicks=dict(outcomes=dict(over=dict(price=-115), under=dict(price=-110))))),
+             dict(stat="Maps 1-3 HS", line=26, start_date="2025-10-30T11:00:00Z", opponent={}, apps={})]
+    rows = pickfinder.player_rows(dict(player_name="KaiR0N", team=dict(name="Nemiga")), games, props,
+                                  pd.Timestamp("2025-05-01", tz="UTC"))
+    assert [(r["source"], r["stat"], r["line"], r["actual"]) for r in rows] == [
+        ("gamelog", "kills", 27.5, 30), ("props", "headshots", 17.5, 18)]
+    assert (rows[1]["book"], rows[1]["over_odds"], rows[1]["under_odds"]) == ("prizepicks", -115, -110)
