@@ -2,48 +2,53 @@
 import numpy as np
 import pandas as pd
 
-from cs2props import model
+from cs2props import lines, model
+
+TEAMS = ["Alpha Gaming", "Bravo", "Charlie", "Delta"]
 
 
 def fake_maps(n_matches=400, seed=0):
-    """BO3s between 4 teams of 5; team 'A' is much stronger, 'koala' (pid 0) gets more kills."""
+    """BO3s between 4 teams of 5. Alpha (team 0) is much stronger; player 0 'maxoff' gets more kills."""
     rng = np.random.default_rng(seed)
-    teams, rows, game = list("ABCD"), [], 0
+    rows, game = [], 0
     for m in range(n_matches):
-        t1, t2 = rng.choice(4, 2, replace=False)
+        t1, t2 = (int(t) for t in rng.choice(4, 2, replace=False))
         for num, mp in enumerate(rng.choice(["de_nuke", "de_ancient", "de_inferno", "de_mirage"], 3, replace=False), 1):
             game += 1
-            p1 = 0.85 if t1 == 0 else 0.15 if t2 == 0 else 0.5
-            w1 = rng.random() < p1
+            w1 = rng.random() < (0.85 if t1 == 0 else 0.15 if t2 == 0 else 0.5)
             for t, o, won in ((t1, t2, w1), (t2, t1, not w1)):
                 for k in range(5):
                     pid = t * 5 + k
-                    kills = rng.poisson(20 if pid == 0 else 15)
+                    kills = int(rng.poisson(20 if pid == 0 else 15))
                     rows.append(dict(match_id=m, start_date=pd.Timestamp("2025-01-01", tz="UTC") + pd.Timedelta(hours=m),
-                                     bo_type=3, game_id=game, map_number=num, map_name=mp, rounds=22,
-                                     team_id=teams[t], team_name=f"Team {teams[t]}", opp_id=teams[o],
-                                     opp_name=f"Team {teams[o]}", player_id=pid, nickname="koala" if pid == 0 else f"p{pid}",
-                                     win=int(won), kills=kills, headshots=kills // 2, deaths=15, adr=80.0, rating=1.0))
+                                     tier="b", bo_type=3, game_id=game, map_number=num, map_name=mp, rounds=22,
+                                     team_id=t, team_name=TEAMS[t], opp_id=o, player_id=pid,
+                                     nickname="max" if pid == 0 else f"p{pid}", win=int(won), kills=kills,
+                                     deaths=15, headshots=kills // 2, assists=4, adr=80.0, kast=70))
     return pd.DataFrame(rows)
 
 
-def test_features_do_not_peek_at_the_match_being_predicted():
+def test_features_never_see_the_match_being_predicted():
     df = fake_maps(60)
-    a = model.series_rows(model.build(df))
-    df.loc[df.match_id == 59, "kills"] += 100
-    b = model.series_rows(model.build(df))
-    last_a, last_b = a[a.match_id == 59], b[b.match_id == 59]
-    pd.testing.assert_frame_equal(last_a[model.FEATURES], last_b[model.FEATURES])
-    assert (last_b.kills_m12 > last_a.kills_m12).all()
+    a = model.features(model.series(df), df)
+    df.loc[df.match_id == 59, ["kills", "headshots"]] += 100
+    b = model.features(model.series(df), df)
+    cols = ["match_id", "player_id"] + model.FEATURES
+    pd.testing.assert_frame_equal(a[a.match_id == 59][cols], b[b.match_id == 59][cols])
+    assert (b[b.match_id == 59].kills_m12.to_numpy() > a[a.match_id == 59].kills_m12.to_numpy()).all()
 
 
-def test_elo_and_probability_math():
-    s = model.series_rows(model.build(fake_maps(400)))
-    late = s[s.match_id > 300]
-    assert late[late.team_id == "A"].win_prob.mean() > 0.7
-    assert model.p_over(np.array([30.0]), [30.5], np.array([1.0]))[0] == 0
-    assert model.p_over(np.array([30.0]), [30.5], np.array([0.9, 1.1]))[0] == 0.5
+def test_elo_probabilities_and_parsing():
+    df = fake_maps(400)
+    s = model.features(model.series(df), df)
+    assert s[(s.match_id > 300) & (s.team_id == 0)].win_prob.mean() > 0.7
+    over, under = model.probs([30.0, 30.0, 30.0], [30.5, 30.5, 30.0], np.array([0.9, 1.0, 1.1]))
+    assert np.allclose(over, [1 / 3] * 3) and np.allclose(under, [2 / 3, 2 / 3, 1 / 3])  # 30.0 line: push 1/3
     assert round(model.american_to_prob(-115), 4) == 0.5349
+    assert lines.market("MAPS 1-2 Kills") == lines.market("kills_on_maps_1_2") == {"stat": "kills", "maps": "1-2"}
+    assert lines.market("1st_3_maps_player_headshots") == {"stat": "headshots", "maps": "1-3"}
+    assert lines.market("2nd_map_player_kills") == {"stat": "kills", "maps": "2"}
+    assert lines.american(1.78) == -128 and lines.american(2.5) == 150
 
 
 def test_train_then_predict(tmp_path, monkeypatch):
@@ -51,16 +56,19 @@ def test_train_then_predict(tmp_path, monkeypatch):
     (tmp_path / "data").mkdir()
     fake_maps(400).to_csv("data/maps.csv", index=False)
     model.train()
-    pd.DataFrame([
-        dict(player="Koala", team="Team A", opponent="Team D", stat="kills", line=30.5, start_time="2026-01-01T00:00Z",
-             book="test", maps="de_nuke,de_ancient"),
-        dict(player="koala", team="Team A", opponent="Team D", stat="headshots", line=25.5,
-             start_time="2026-01-01T00:00Z", book="test"),
-        dict(player="nobody", team="X", opponent="Y", stat="kills", line=30.5, start_time="2026-01-01T00:00Z"),
+    when = "2026-01-01T00:00:00Z"
+    pd.DataFrame([  # the book calls player 'max' "MaxOff" and the team "Team Alpha Esports"
+        dict(book="a", player="MaxOff", team="Team Alpha Esports", opponent="Delta", stat="kills", maps="1-2",
+             line=30.5, start_time=when),
+        dict(book="b", player="maxoff", team="Alpha", opponent="Delta", stat="headshots", maps="1-2",
+             line=25.5, over_odds=-112, under_odds=-112, start_time=when),
+        dict(book="a", player="p7", team="Bravo", opponent="Charlie", stat="kills", maps="1-3", line=45.5, start_time=when),
+        dict(book="a", player="nobody", team="X", opponent="Y", stat="kills", maps="1-2", line=30.5, start_time=when),
     ]).to_csv("data/lines.csv", index=False)
     model.predict()
-    picks = pd.read_csv("data/picks.csv").set_index("stat", append=True)
-    kills = picks.xs("kills", level="stat")
-    assert kills.set_index("player").loc["Koala", "pick"] == "OVER"   # ~40 expected vs 30.5
-    assert kills.set_index("player").loc["nobody", "pick"] == "NO DATA"
-    assert picks.xs("headshots", level="stat").iloc[0]["pick"] == "UNDER"  # ~20 expected vs 25.5
+    picks = pd.read_csv("data/picks.csv").set_index(["player", "stat"])
+    assert picks.loc[("MaxOff", "kills"), "matched"] == "max"
+    assert picks.loc[("MaxOff", "kills"), "pick"] == "OVER"         # ~40 expected vs 30.5
+    assert picks.loc[("maxoff", "headshots"), "pick"] == "UNDER"    # ~20 expected vs 25.5
+    assert picks.loc[("nobody", "kills"), "pick"] == "NO DATA"
+    assert ("p7", "kills") not in picks.index                        # maps 1-3 is not modelled
