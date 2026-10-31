@@ -261,52 +261,64 @@ def profit(odds):
 def backtest(props_csv=PROPS_CSV, maps_csv=MAPS_CSV):
     """Grade the model on real past lines (PickFinder prop history, or data/lines_history.csv).
 
-    Models are refit only on matches before the first graded line, and features are as of each
-    line's start time, so nothing the bettor couldn't have known leaks in.
+    Each line is first matched to its own bo3.gg series: same player and opponent, starting within
+    90 minutes (book and bo3.gg times differ by minutes; same-day rematches are 2+ hours apart). Features
+    are then taken strictly before the earlier of the two start times, and the trees are refit only on
+    matches before the first graded line, so the graded match never leaks into its own prediction.
     """
     df = load(maps_csv)
     props = pd.read_csv(props_csv)
-    if "scraped_at" in props:  # our own archive: keep each line's last snapshot before the match (closing line)
-        props = props[pd.to_datetime(props.scraped_at, utc=True, format="ISO8601")
-                      <= pd.to_datetime(props.start_time, utc=True, format="ISO8601")]
-        props = props.sort_values("scraped_at").drop_duplicates(["book", "player", "stat", "maps", "start_time"], keep="last")
-    feats = features(series(df), df)
-    cutoff = pd.to_datetime(props.start_time, utc=True, format="ISO8601").min()
-    # ponytail: one cutoff; a monthly walk-forward refit would use more training data for later lines.
-    bundles = fit_models(feats[feats.start_date < cutoff], verbose=False)
-    out = score(props, df, bundles)
-
-    # Result from bo3.gg: the player's maps 1-2 total vs the same opponent, starting within 12 h of the line.
+    props = props[props.stat.isin(STATS) & (props.maps.astype(str) == "1-2")].reset_index(drop=True)
+    props["start_date"] = pd.to_datetime(props.start_time, utc=True, format="ISO8601")
+    props = resolve(props.dropna(subset=["start_date"]).reset_index(drop=True), df)
     res = series(df)[["player_id", "opp_id", "start_date", "kills_m12", "headshots_m12"]]
     res = res.rename(columns={"start_date": "match_start"}).astype({"player_id": float, "opp_id": int})
-    out = pd.merge_asof(out.sort_values("start_date"), res.sort_values("match_start"), left_on="start_date",
-                        right_on="match_start", by=["player_id", "opp_id"], direction="nearest",
-                        tolerance=pd.Timedelta(hours=12))
-    bo3 = np.where(out.stat == "kills", out.kills_m12, out.headshots_m12)
-    if "actual" in out:
-        both = out.actual.notna() & pd.notna(bo3)
+    props = pd.merge_asof(props.sort_values("start_date"), res.sort_values("match_start"), left_on="start_date",
+                          right_on="match_start", by=["player_id", "opp_id"], direction="nearest",
+                          tolerance=pd.Timedelta(minutes=90))
+    props = props[props.match_start.notna()].copy()
+    props["start_time"] = props.start_date.where(props.start_date < props.match_start, props.match_start)
+    if "scraped_at" in props:  # our archive: each book's last snapshot before the match is its closing line
+        props = props[pd.to_datetime(props.scraped_at, utc=True, format="ISO8601") < props.start_time]
+        props = props.sort_values("scraped_at").drop_duplicates(["book", "player_id", "stat", "maps", "match_start"],
+                                                                keep="last")
+    if props.empty:
+        return print("no gradable lines: none matched a bo3.gg series of that player vs that opponent "
+                     "(run history first; the match may not be finished)")
+
+    feats = features(series(df), df)
+    cutoff = props.start_time.min()
+    # ponytail: one cutoff; a monthly walk-forward refit would use more training data for later lines.
+    bundles = fit_models(feats[feats.start_date < cutoff], verbose=False)
+    out = score(props.drop(columns=["start_date", "player_id", "team_id", "opp_id", "matched"]), df, bundles)
+
+    bo3 = pd.Series(np.where(out.stat == "kills", out.kills_m12, out.headshots_m12), index=out.index)
+    if "actual" in out:  # the file's result is what settled; bo3.gg is a cross-check
+        both = out.actual.notna()
         print(f"actual results: source file agrees with bo3.gg on {(out.actual[both] == bo3[both]).mean():.1%} "
               f"of {both.sum()} lines")
-        out["actual"] = out.actual.fillna(pd.Series(bo3, index=out.index))
+        out["actual"] = out.actual.fillna(bo3)
     else:
         out["actual"] = bo3
-    out = out[out.actual.notna() & out.p_over.notna()].copy()
+    out = out[out.p_over.notna()].copy()
     if out.empty:
-        return print("no gradable lines yet: their matches have no bo3.gg result (run history first) or no "
-                     "usable player history")
+        return print("no gradable lines: the matched players have too little history before the line")
     out["result"] = np.select([out.actual > out.line, out.actual < out.line], ["OVER", "UNDER"], "PUSH")
     bet = out[out.pick.isin(["OVER", "UNDER"])].copy()
     odds = np.where(bet.pick == "OVER", bet.over_odds, bet.under_odds)
     bet["units"] = np.select([bet.result == bet.pick, bet.result == "PUSH"], [profit(odds), 0.0], -1.0)
     bet["breakeven"] = pd.Series(odds, index=bet.index).map(american_to_prob)
     bet["won"], bet["push"] = bet.result == bet.pick, bet.result == "PUSH"
+    bet["series_key"] = bet.player_id.astype(str) + bet.stat + bet.match_start.astype(str)
     out.merge(bet[["units"]], left_index=True, right_index=True, how="left").to_csv(BACKTEST_CSV, index=False)
 
     def summary(g):
         decided = g[~g.push]
         hit = decided.won.mean() if len(decided) else np.nan
-        ci = 1.96 * np.sqrt(hit * (1 - hit) / max(len(decided), 1))
-        return pd.Series({"bets": len(g), "hit": hit, "+/-95%": ci, "breakeven": g.breakeven.mean(),
+        # Copies of one line at several books share one outcome, so the band counts player-series, not rows.
+        n = decided.series_key.nunique()
+        ci = 1.96 * np.sqrt(hit * (1 - hit) / max(n, 1))
+        return pd.Series({"bets": len(g), "series": n, "hit": hit, "+/-95%": ci, "breakeven": g.breakeven.mean(),
                           "units": g.units.sum(), "roi": g.units.sum() / max(len(g), 1)})
 
     print(f"\n{len(out)} graded lines from {out.start_date.min():%Y-%m-%d} to {out.start_date.max():%Y-%m-%d} "

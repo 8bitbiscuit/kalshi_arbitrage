@@ -94,21 +94,19 @@ def sleeper():
 
 
 def pickfinder():
-    from cs2props.pickfinder import current_props, session  # Selenium login; see pickfinder.py
+    from cs2props.pickfinder import current_props, main_prices, session  # Selenium login; see pickfinder.py
 
     with session() as get:
         for it in current_props(get):
             if it.get("isAltLine"):
                 continue
             for book, app in (it.get("apps") or {}).items():
-                if book in ("prizepicks", "underdog", "sleeper"):  # already fetched directly
+                prices = main_prices(app)  # skips goblin/demon/boosted and one-sided lines
+                if book in ("prizepicks", "underdog", "sleeper") or not prices:  # those three are fetched directly
                     continue
-                out = app.get("outcomes") or {}
                 yield dict(book=book, player=it["player_name"], team=(it.get("team") or {}).get("name"),
-                           opponent=(it.get("opponent") or {}).get("name"), line=it["line"],
-                           over_odds=(out.get("over") or {}).get("price"),
-                           under_odds=(out.get("under") or {}).get("price"),
-                           start_time=it.get("start_date"), **market(it["market_id"]))
+                           opponent=(it.get("opponent") or {}).get("name"), line=it["line"], over_odds=prices[0],
+                           under_odds=prices[1], start_time=it.get("start_date"), **market(it["market_id"]))
 
 
 def main():

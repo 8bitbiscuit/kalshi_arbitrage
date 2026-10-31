@@ -1,6 +1,4 @@
 """python -m pytest cs2props -q"""
-import re
-
 import numpy as np
 import pandas as pd
 
@@ -102,16 +100,20 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
     s = model.series(df)
     late = s[(s.match_id >= 300) & s.player_id.isin([0, 7])]  # 'max' averages ~40, 'p7' ~30
     names = dict(enumerate(TEAMS))
-    pd.DataFrame(dict(book="pf", player=late.player_id.map({0: "max", 7: "p7"}), team=late.team_id.map(names),
-                      opponent=late.opp_id.map(names), stat="kills", maps="1-2",
-                      line=late.player_id.map({0: 30.5, 7: 36.5}), over_odds=-115, under_odds=-115,
-                      start_time=late.start_date.dt.strftime("%Y-%m-%dT%H:%M:%SZ"), actual=late.kills_m12)
-                 ).to_csv("data/prop_history.csv", index=False)
-    model.backtest()
-    agree = re.search(r"agrees with bo3.gg on ([\d.]+)%", capsys.readouterr().out)
-    assert float(agree.group(1)) >= 95  # not 100: a map can fail load()'s sanity checks
-    bt = pd.read_csv("data/backtest.csv")
-    assert len(bt) == len(late)
+
+    def run(shift):  # the book lists the match `shift` away from bo3.gg's start time
+        pd.DataFrame(dict(book="pf", player=late.player_id.map({0: "max", 7: "p7"}), team=late.team_id.map(names),
+                          opponent=late.opp_id.map(names), stat="kills", maps="1-2",
+                          line=late.player_id.map({0: 30.5, 7: 36.5}), over_odds=-115, under_odds=-115,
+                          start_time=(late.start_date + shift).dt.strftime("%Y-%m-%dT%H:%M:%SZ"), actual=late.kills_m12)
+                     ).to_csv("data/prop_history.csv", index=False)
+        model.backtest()
+        return pd.read_csv("data/backtest.csv").sort_values(["player", "match_start"]).reset_index(drop=True)
+
+    early, bt = run(pd.Timedelta(minutes=-5)), run(pd.Timedelta(minutes=5))
+    assert "agrees with bo3.gg on 100.0%" in capsys.readouterr().out
+    pd.testing.assert_series_equal(early.proj, bt.proj)  # listing the match late must not leak its result
+    assert len(bt) >= 0.95 * len(late)  # a few series fail load()'s sanity checks and are not graded
     assert (bt[bt.player == "max"].pick == "OVER").mean() > 0.9
     assert (bt[bt.player == "p7"].pick == "UNDER").mean() > 0.9
     assert bt.units.sum() > 0
@@ -119,15 +121,31 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
 
 def test_pickfinder_history_rows():
     from cs2props import pickfinder
-    games = [dict(startTime="2025-10-30 12:02:35.000Z", vs="Vitality", vsAbbr="VIT", lines={"Maps 1-2 Kills": 27.5},
-                  periodStats=[dict(kills=17, headshots=11), dict(kills=13, headshots=7)]),
-             dict(startTime="2025-10-28 12:00:00.000Z", vs="Bo1 side", vsAbbr="X", periodStats=[dict(kills=20, headshots=9)])]
-    props = [dict(stat="Maps 1-2 HS", line=17.5, start_date="2025-10-30T11:00:00Z",  # abbreviation differs from gamelog
-                  opponent=dict(name="Team Vitality", abbreviation="VITALITY"),
-                  apps=dict(prizepicks=dict(outcomes=dict(over=dict(price=-115), under=dict(price=-110))))),
-             dict(stat="Maps 1-3 HS", line=26, start_date="2025-10-30T11:00:00Z", opponent={}, apps={})]
-    rows = pickfinder.player_rows(dict(player_name="KaiR0N", team=dict(name="Nemiga")), games, props,
+
+    def game(start, vs, abbr, kills, score=(2, 0), **extra):
+        return dict(startTime=start, team="Nemiga", vs=vs, vsAbbr=abbr, scores=[dict(score=score[0]), dict(score=score[1])],
+                    periodStats=[dict(kills=k, headshots=k // 2) for k in kills], **extra)
+
+    def prop(start, opp, abbr, line=27.5, outcomes=None):
+        return dict(stat="Maps 1-2 Kills", line=line, start_date=start, team=dict(name="Nemiga"),
+                    opponent=dict(name=opp, abbreviation=abbr),
+                    apps=dict(prizepicks=dict(outcomes=outcomes or dict(over=dict(price=-115), under=dict(price=-110)))))
+
+    games = [game("2025-10-30 12:02:35.000Z", "Vitality", "VIT", [17, 13], lines={"Maps 1-2 Kills": 27.5}),
+             game("2025-09-07 11:07:00.000Z", "Copenhagen Wolves", "CW", [15, 15]),   # same-day rematch ...
+             game("2025-09-07 08:06:00.000Z", "Copenhagen Wolves", "CW", [20, 17]),   # ... the one at 08:00
+             game("2025-09-01 12:00:00.000Z", "Sat out", "SO", [20, 20], score=(2, 1)),  # missed a map: not maps 1-2
+             game("2025-10-28 12:00:00.000Z", "Bo1 side", "X", [20])]
+    props = [prop("2025-10-30T12:00:00Z", "Team Vitality", "VITALITY"),        # abbreviations differ: match by name
+             prop("2025-09-07T08:00:00Z", "Copenhagen Wolves", "CW"),
+             prop("2025-10-31T11:00:00Z", "FURIA", "FURIA"),                    # result not logged yet: no row
+             prop("2025-09-01T12:00:00Z", "Sat out", "SO"),
+             prop("2025-10-30T12:00:00Z", "Vitality", "VIT", line=33.5,         # demon: over only, can't bet under
+                  outcomes=dict(over=dict(price=-110, modifier="demon")))]
+    rows = pickfinder.player_rows(dict(player_name="KaiR0N", team=dict(name="New team")), games, props,
                                   pd.Timestamp("2025-05-01", tz="UTC"))
-    assert [(r["source"], r["stat"], r["line"], r["actual"]) for r in rows] == [
-        ("gamelog", "kills", 27.5, 30), ("props", "headshots", 17.5, 18)]
+    assert [(r["source"], r["opponent"], r["line"], r["actual"], r["team"]) for r in rows] == [
+        ("gamelog", "Vitality", 27.5, 30, "Nemiga"),
+        ("props", "Team Vitality", 27.5, 30, "Nemiga"),
+        ("props", "Copenhagen Wolves", 27.5, 37, "Nemiga")]
     assert (rows[1]["book"], rows[1]["over_odds"], rows[1]["under_odds"]) == ("prizepicks", -115, -110)

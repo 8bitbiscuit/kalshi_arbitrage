@@ -159,12 +159,20 @@ are two sources:
 
 `python -m cs2props.model backtest [csv]` then grades the model on those lines:
 
-- **No look-ahead:** the trees are refit on matches *before* the first graded line, and every feature is
-  computed as of each line's start time.
-- **Results** come from the file and are cross-checked against bo3.gg. It prints the agreement rate, and
-  bo3.gg fills any missing result.
+- **Matching:** each line is first matched to its own bo3.gg series: same player, same opponent, starting
+  within 90 minutes. Book and bo3.gg times differ by minutes, while same-day rematches are 2+ hours apart.
+  Lines whose series isn't in bo3.gg are not graded rather than graded against the wrong match.
+- **No look-ahead:**
+  - The trees are refit on matches *before* the first graded line.
+  - Features are taken strictly before the *earlier* of the book's and bo3.gg's start time. Books and
+    PickFinder often list a start a few minutes after bo3.gg does, and using the later time let the graded
+    match into its own features (a test now checks this).
+- **Closing line:** for our archive, each book's last snapshot before that time, one per series.
+- **Results** come from the file (what settled) and are cross-checked against bo3.gg. The agreement rate
+  is printed.
 - **The report** covers:
-  - hit rate with its 95% band, versus breakeven
+  - hit rate with its 95% band, versus breakeven. The band counts distinct player-series, because the
+    same line at three books is one outcome, not three
   - units won and ROI at each line's own price
   - all of that split by edge bucket, stat, OVER/UNDER and book
   - "always over / always under" baselines

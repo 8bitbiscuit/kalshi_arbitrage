@@ -23,6 +23,7 @@ from contextlib import contextmanager
 import pandas as pd
 
 from cs2props.lines import COLS, http
+from cs2props.model import team_key
 
 API, SITE = "https://api-v2.pickfinder.app", "https://www.pickfinder.app"
 MARKETS = {"Maps 1-2 Kills": "kills", "Maps 1-2 HS": "headshots"}  # PickFinder's display names
@@ -74,46 +75,58 @@ def current_props(get):
 
 
 def series_results(games):
-    """Series with 2+ maps: start time, opponent, maps 1-2 kills/headshots, and any archived lines."""
+    """Series with 2+ maps where the player played every map, so periodStats[:2] really are maps 1 and 2
+    (the gamelog leaves out maps a player sat out)."""
     return [{**{stat: sum(m.get(stat) or 0 for m in g["periodStats"][:2]) for stat in MARKETS.values()},
-             "start": pd.to_datetime(g["startTime"], utc=True), "vs": g.get("vs"),
-             "abbr": str(g.get("vsAbbr", "")).upper(), "lines": g.get("lines") or {}}
-            for g in games if len(g.get("periodStats") or []) >= 2]
+             "start": pd.to_datetime(g["startTime"], utc=True), "team": g.get("team"), "vs": g.get("vs"),
+             "abbr": (g.get("vsAbbr") or "").upper(), "lines": g.get("lines") or {}}
+            for g in games if len(g.get("periodStats") or []) >= 2
+            and len(g["periodStats"]) == sum(x.get("score") or 0 for x in g.get("scores") or [])]
 
 
-def lookup(results, start, opp_abbr):
-    """The series within 36 h of the prop's start (book and PickFinder times differ): same opponent
-    abbreviation first, else the only series in that window."""
-    near = [r for r in results if abs(r["start"] - start) <= pd.Timedelta(hours=36)]
-    same = [r for r in near if r["abbr"] == str(opp_abbr).upper()]
-    return same[0] if same else near[0] if len(near) == 1 else None
+def lookup(results, start, opponent):
+    """The prop's own series: same opponent (abbreviation, else normalised name), starting between 3 h before
+    and 12 h after the listed time (matches start late, rarely early); the nearest one if several."""
+    abbr, name = (opponent.get("abbreviation") or "").upper(), team_key(opponent.get("name"))
+    same = [r for r in results if pd.Timedelta(hours=-3) <= r["start"] - start <= pd.Timedelta(hours=12)
+            and ((abbr and abbr == r["abbr"]) or name == team_key(r["vs"]))]
+    return min(same, key=lambda r: abs(r["start"] - start)) if same else None
+
+
+def main_prices(app):
+    """(over, under) prices of a book's main line; None for goblin/demon/boosted or one-sided lines."""
+    out = app.get("outcomes") or {}
+    sides = [out.get("over"), out.get("under")]
+    if all(sides) and all(side.get("modifier") in (None, "", "none") for side in sides):
+        return sides[0].get("price"), sides[1].get("price")
+    return None
 
 
 def player_rows(it, games, props, since):
     """Prop-history rows (backtest schema + actual) for one player from their gamelog and props responses."""
-    name, team = it["player_name"], (it.get("team") or {}).get("name")
-    results, rows = series_results(games), []
+    name, results, rows = it["player_name"], series_results(games), []
     for r in results:  # lines archived in the gamelog itself
         if r["start"] >= since:
             for display, stat in MARKETS.items():
                 if r["lines"].get(display) is not None:
-                    rows.append(dict(book="pickfinder", player=name, team=team, opponent=r["vs"], stat=stat, maps="1-2",
-                                     line=r["lines"][display], start_time=r["start"].isoformat(), actual=r[stat],
-                                     source="gamelog"))
+                    rows.append(dict(book="pickfinder", player=name, team=r["team"], opponent=r["vs"], stat=stat,
+                                     maps="1-2", line=r["lines"][display], start_time=r["start"].isoformat(),
+                                     actual=r[stat], source="gamelog"))
     now = pd.Timestamp.now(tz="UTC")
-    for p in props:  # past prop items, one row per book
+    for p in props:  # past prop items, one row per book offering the main line
         if p.get("stat") not in MARKETS or p.get("isAltLine") or not p.get("start_date"):
             continue
-        start = pd.to_datetime(p["start_date"], utc=True)
-        r = lookup(results, start, (p.get("opponent") or {}).get("abbreviation"))
-        if not (since <= start < now) or r is None:
+        start, opp = pd.to_datetime(p["start_date"], utc=True), p.get("opponent") or {}
+        r = lookup(results, start, opp)
+        if not (since <= start < now) or r is None:  # result not logged yet: picked up by a later run
             continue
         for book, app in (p.get("apps") or {}).items():
-            out = app.get("outcomes") or {}
-            rows.append(dict(book=book, player=name, team=team, opponent=(p.get("opponent") or {}).get("name"),
-                             stat=MARKETS[p["stat"]], maps="1-2", line=p["line"],
-                             over_odds=(out.get("over") or {}).get("price"), under_odds=(out.get("under") or {}).get("price"),
-                             start_time=start.isoformat(), actual=r[MARKETS[p["stat"]]], source="props"))
+            prices = main_prices(app)
+            if prices:
+                rows.append(dict(book=book, player=name, team=(p.get("team") or {}).get("name") or r["team"],
+                                 opponent=opp.get("name"), stat=MARKETS[p["stat"]], maps="1-2", line=p["line"],
+                                 over_odds=prices[0], under_odds=prices[1], start_time=start.isoformat(),
+                                 actual=r[MARKETS[p["stat"]]], source="props"))
     return rows
 
 
@@ -143,8 +156,8 @@ def history(months=6):
             print(f"{n}/{len(players)} {it['player_name']}: {len(games)} games, {len(new)} past lines")
     cols = COLS + ["actual", "source"]
     df = pd.DataFrame(rows, columns=cols).drop_duplicates(["book", "player", "stat", "start_time", "line"])
-    if os.path.exists(PROPS_CSV):  # keep lines from earlier runs (other players, older dates)
-        df = pd.concat([pd.read_csv(PROPS_CSV), df]).drop_duplicates(["book", "player", "stat", "start_time", "line"])
+    if os.path.exists(PROPS_CSV):  # keep earlier runs' lines (other players, older dates); new rows win
+        df = pd.concat([df, pd.read_csv(PROPS_CSV)]).drop_duplicates(["book", "player", "stat", "start_time", "line"])
     df.to_csv(PROPS_CSV, index=False)
     print(f"{len(df)} past lines in {PROPS_CSV}; next: python -m cs2props.model backtest")
     if not rows:
