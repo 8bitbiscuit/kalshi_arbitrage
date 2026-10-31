@@ -2,20 +2,23 @@
 
     python -m cs2props.model train     # data/maps.csv  -> data/model_{kills,headshots}.joblib
     python -m cs2props.model predict   # data/lines.csv -> data/picks.csv
-    python -m cs2props.model backtest [data/prop_history.csv | data/lines_history.csv]
+    python -m cs2props.model backtest [data/prop_history.csv | data/lines_history.csv] [gbm | tree]
+    python -m cs2props.model compare   # gradient boosting vs a single decision tree, same test data
 
-The tree predicts the stat itself (e.g. maps 1-2 kills). There are no historical prop lines to label
-"over/under" with, so P(over line) comes from the tree's projection plus the spread of its held-out errors.
+The model (gradient-boosted trees by default) predicts the stat itself (e.g. maps 1-2 kills). There are
+no historical prop lines to label "over/under" with, so P(over line) comes from the projection plus the
+spread of its held-out errors.
 Any line, from any book, can then be scored without retraining.
 """
 import difflib
 import re
 import sys
-from itertools import product
 
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.inspection import permutation_importance
 from sklearn.tree import DecisionTreeRegressor
 
 MAPS_CSV, LINES_CSV, PICKS_CSV = "data/maps.csv", "data/lines.csv", "data/picks.csv"
@@ -25,7 +28,7 @@ FEATURES = ["kills_l20", "kills_l5", "headshots_l20", "hs_pct", "kpr", "adr_l20"
             "maps_played", "map_factor", "win_prob", "elo_opp"]
 # Rows lacking these are skipped (fewer than 5 maps of history). Other features may be NaN (e.g. a
 # missing ADR); scikit-learn trees handle NaN natively.
-NEED ={"kills": ["kills_l20", "kpr", "map_factor"], "headshots": ["kills_l20", "kpr", "map_factor", "hs_pct"]}
+NEED = {"kills": ["kills_l20", "kpr", "map_factor"], "headshots": ["kills_l20", "kpr", "map_factor", "hs_pct"]}
 PRIOR_ROUNDS = 100   # shrink a player's per-map KPR toward their recent KPR by this many rounds
 POOL = 15            # a team's last 15 maps stand in for the unknown veto
 DEFAULT_ODDS = -119  # lines without a price (PrizePicks): breakeven 54.3%, about a 5/6-pick flex entry
@@ -131,12 +134,23 @@ def series(df):
     return s[s.n == 2].drop(columns="n").reset_index()
 
 
-def fit(X, y, depth, leaf):
-    return DecisionTreeRegressor(max_depth=depth, min_samples_leaf=leaf, random_state=0).fit(X, y)
+MODEL = "gbm"  # "gbm": gradient-boosted trees (default); "tree": one decision tree
+GRIDS = {  # settings tried on the validation slice; the lowest MAE wins
+    "tree": [dict(max_depth=d, min_samples_leaf=n) for d in (3, 4, 5, 6, 8, 10) for n in (25, 50, 100, 200, 400)],
+    "gbm": [dict(loss=loss, learning_rate=lr, max_leaf_nodes=n) for loss in ("squared_error", "poisson")
+            for lr in (0.05, 0.1) for n in (15, 31)],
+}
 
 
-def fit_models(feats, verbose=True):
-    """Per stat: tune on a time split, report on the newest 15%, refit on the rest. Returns {stat: bundle}."""
+def fit(X, y, kind, params):
+    if kind == "tree":
+        return DecisionTreeRegressor(random_state=0, **params).fit(X, y)
+    # Early stopping holds out 10% of the rows it is given and stops adding trees once they stop helping.
+    return HistGradientBoostingRegressor(max_iter=1000, early_stopping=True, random_state=0, **params).fit(X, y)
+
+
+def fit_models(feats, kind=MODEL, verbose=True):
+    """Per stat: tune on a time split, score the newest 15%, refit on the rest. Returns {stat: bundle}."""
     be, bundles = american_to_prob(DEFAULT_ODDS), {}
     for stat in STATS:
         y = f"{stat}_m12"
@@ -147,40 +161,53 @@ def fit_models(feats, verbose=True):
         def mae(m, d):
             return np.abs(m.predict(d[FEATURES]) - d[y]).mean()
 
-        depth, leaf = min(product((3, 4, 5, 6, 8, 10), (25, 50, 100, 200, 400)),
-                          key=lambda p: mae(fit(tr[FEATURES], tr[y], *p), va))
-        model = fit(tr[FEATURES], tr[y], depth, leaf)
+        params = min(GRIDS[kind], key=lambda p: mae(fit(tr[FEATURES], tr[y], kind, p), va))
+        model = fit(tr[FEATURES], tr[y], kind, params)
         p = np.maximum(model.predict(va[FEATURES]), 1e-9)
         z = ((va[y] - p) / np.sqrt(p)).to_numpy()
         z = z - z.mean()  # keep the spread, drop any level shift between the train and validation periods
 
-        if verbose:  # honest check on the untouched last 15%: does the tree beat "2 x 20-map average"?
-            pred, base, actual = model.predict(te[FEATURES]), 2 * te[f"{stat}_l20"].to_numpy(), te[y].to_numpy()
-            line = np.floor(base) + 0.5  # stand-in line; real books are sharper than this
-            po, pu = probs(pred, line, z)
-            bet_o, bet_u = po > be, pu > be
-            hits = (actual[bet_o] > line[bet_o]).sum() + (actual[bet_u] < line[bet_u]).sum()
-            bets = bet_o.sum() + bet_u.sum()
-            print(f"\n{stat}: {n} player-series | train {len(tr)} | validate {len(va)} | test {len(te)} "
-                  f"({te.start_date.iloc[0]:%Y-%m-%d} to {te.start_date.iloc[-1]:%Y-%m-%d})\n"
-                  f"   depth={depth} leaf={leaf} | test MAE: tree {np.abs(pred - actual).mean():.2f} vs "
-                  f"2 x 20-map avg {np.abs(base - actual).mean():.2f}\n"
-                  f"   stand-in-line bets {bets}/{len(te)}, hit {hits / max(bets, 1):.1%} (breakeven {be:.1%}; "
-                  f"optimistic, real lines are sharper) | Brier {np.mean((po - (actual > line)) ** 2):.3f} vs 0.250")
-            top = sorted(zip(model.feature_importances_, FEATURES), reverse=True)[:5]
-            print("   top features: " + ", ".join(f"{name} {imp:.2f}" for imp, name in top))
+        # Honest check on the untouched last 15%: does the model beat "2 x 20-map average"?
+        pred, base, actual = model.predict(te[FEATURES]), 2 * te[f"{stat}_l20"].to_numpy(), te[y].to_numpy()
+        line = np.floor(base) + 0.5  # stand-in line; real books are sharper than this
+        po, pu = probs(pred, line, z)
+        bet_o, bet_u = po > be, pu > be
+        bets = bet_o.sum() + bet_u.sum()
+        metrics = dict(model=kind, stat=stat, test_mae=np.abs(pred - actual).mean(),
+                       avg20_mae=np.abs(base - actual).mean(), bets=bets,
+                       hit=((actual[bet_o] > line[bet_o]).sum() + (actual[bet_u] < line[bet_u]).sum()) / max(bets, 1),
+                       brier=np.mean((po - (actual > line)) ** 2))
+        if verbose:
+            print(f"\n{stat} ({kind}): {n} player-series | train {len(tr)} | validate {len(va)} | test {len(te)} "
+                  f"({te.start_date.iloc[0]:%Y-%m-%d} to {te.start_date.iloc[-1]:%Y-%m-%d})\n   {params}\n"
+                  f"   test MAE: model {metrics['test_mae']:.2f} vs 2 x 20-map avg {metrics['avg20_mae']:.2f}\n"
+                  f"   stand-in-line bets {bets}/{len(te)}, hit {metrics['hit']:.1%} (breakeven {be:.1%}; "
+                  f"optimistic, real lines are sharper) | Brier {metrics['brier']:.3f} vs 0.250")
+            sample = te.sample(min(3000, len(te)), random_state=0)
+            imp = permutation_importance(model, sample[FEATURES], sample[y], n_repeats=3, random_state=0,
+                                         scoring="neg_mean_absolute_error").importances_mean
+            print("   top features (MAE rise when shuffled): " +
+                  ", ".join(f"{name} {v:.2f}" for v, name in sorted(zip(imp, FEATURES), reverse=True)[:5]))
 
         # ponytail: z comes from the 70%-data model, so production intervals are slightly wide.
         both = pd.concat([tr, va])
-        bundles[stat] = {"model": fit(both[FEATURES], both[y], depth, leaf), "z": np.sort(z)}
+        bundles[stat] = {"model": fit(both[FEATURES], both[y], kind, params), "z": np.sort(z), "metrics": metrics}
     return bundles
 
 
-def train(maps_csv=MAPS_CSV):
+def train(maps_csv=MAPS_CSV, kind=MODEL):
     df = load(maps_csv)
-    for stat, bundle in fit_models(features(series(df), df)).items():
+    for stat, bundle in fit_models(features(series(df), df), kind).items():
         joblib.dump(bundle, f"data/model_{stat}.joblib")
     print("saved data/model_kills.joblib, data/model_headshots.joblib")
+
+
+def compare(maps_csv=MAPS_CSV):
+    """Decision tree vs gradient boosting on the same time split (nothing is saved)."""
+    df = load(maps_csv)
+    feats = features(series(df), df)
+    rows = [b["metrics"] for kind in ("tree", "gbm") for b in fit_models(feats, kind, verbose=False).values()]
+    print(pd.DataFrame(rows).set_index(["stat", "model"]).round(3).to_string())
 
 
 def key(x):
@@ -258,7 +285,7 @@ def profit(odds):
     return np.where(odds > 0, odds / 100, 100 / np.abs(odds))
 
 
-def backtest(props_csv=PROPS_CSV, maps_csv=MAPS_CSV):
+def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     """Grade the model on real past lines (PickFinder prop history, or data/lines_history.csv).
 
     Each line is first matched to its own bo3.gg series: same player and opponent, starting within
@@ -289,7 +316,7 @@ def backtest(props_csv=PROPS_CSV, maps_csv=MAPS_CSV):
     feats = features(series(df), df)
     cutoff = props.start_time.min()
     # ponytail: one cutoff; a monthly walk-forward refit would use more training data for later lines.
-    bundles = fit_models(feats[feats.start_date < cutoff], verbose=False)
+    bundles = fit_models(feats[feats.start_date < cutoff], kind, verbose=False)
     out = score(props.drop(columns=["start_date", "player_id", "team_id", "opp_id", "matched"]), df, bundles)
 
     bo3 = pd.Series(np.where(out.stat == "kills", out.kills_m12, out.headshots_m12), index=out.index)
@@ -322,7 +349,7 @@ def backtest(props_csv=PROPS_CSV, maps_csv=MAPS_CSV):
                           "units": g.units.sum(), "roi": g.units.sum() / max(len(g), 1)})
 
     print(f"\n{len(out)} graded lines from {out.start_date.min():%Y-%m-%d} to {out.start_date.max():%Y-%m-%d} "
-          f"(models trained on matches before {cutoff:%Y-%m-%d}); {len(bet)} bets, {(out.result == 'PUSH').sum()} pushes")
+          f"({kind} models trained on matches before {cutoff:%Y-%m-%d}); {len(bet)} bets, {(out.result == 'PUSH').sum()} pushes")
     print("\nAll bets:\n" + summary(bet).round(3).to_string())
     bet["edge_bucket"] = pd.cut(bet.edge, [0, 0.05, 0.10, 1], labels=["0-5%", "5-10%", "10%+"])
     for col in ("edge_bucket", "stat", "pick", "book"):
@@ -338,4 +365,4 @@ def backtest(props_csv=PROPS_CSV, maps_csv=MAPS_CSV):
 
 if __name__ == "__main__":
     cmd, *args = sys.argv[1:] or ["train"]
-    {"train": train, "predict": predict, "backtest": backtest}[cmd](*args)
+    {"train": train, "predict": predict, "backtest": backtest, "compare": compare}[cmd](*args)

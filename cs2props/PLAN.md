@@ -2,7 +2,7 @@
 
 Goal: for each current "Maps 1-2 Kills" / "Maps 1-2 Headshots" line (PrizePicks, Underdog, Sleeper,
 optionally every book PickFinder tracks), predict whether the player goes over or under, using a
-decision tree trained on CS2 match history.
+gradient-boosted decision trees trained on CS2 match history.
 
 ```
 bo3.gg API ──history.py──▶ data/maps.csv ──model.py train──▶ data/model_*.joblib
@@ -17,7 +17,8 @@ PickFinder history ──pickfinder.py──▶ data/prop_history.csv ─┴─m
 ```bash
 pip install -r cs2props/requirements.txt
 python -m cs2props.history          # first run about 1 hour (all of CS2); later runs take a minute
-python -m cs2props.model train      # prints honest test metrics, saves the two trees
+python -m cs2props.model train      # prints honest test metrics, saves the two models
+python -m cs2props.model compare    # gradient boosting vs a single decision tree on the same test data
 python -m cs2props.lines            # current lines from PrizePicks, Underdog, Sleeper (no login)
 python -m cs2props.model predict    # prints and saves picks, best edge first
 python -m cs2props.pickfinder history            # past lines + results from PickFinder (your login)
@@ -66,10 +67,10 @@ The same things PickFinder shows in the screenshots, built so nothing from the p
 | `adr_l20`, `kast_l20` | Damage per round, KAST | K/D, rating |
 | `map_factor` | Player's KPR on each map (shrunk toward overall KPR with a 100-round prior), weighted by how often **both teams** played each map in their last 15 maps, divided by overall KPR | Map Picks + per-map Kills/KPR |
 | `win_prob`, `elo_opp` | Map-level Elo built from every bo3.gg result; win probability for the player's team and opponent strength. A team id seen for the first time (a roster moving org, e.g. LP to BARCA) starts from its players' previous teams' ratings | Moneyline implied win % |
-| `maps_played` | Experience; lets the tree distrust thin histories | sample size |
+| `maps_played` | Experience; lets the model distrust thin histories | sample size |
 
 Why map pool, not actual maps: lines lock before the veto, and bo3.gg has had no veto data since
-mid-September 2026. Using the actual maps in training but not at prediction time would teach the tree
+mid-September 2026. Using the actual maps in training but not at prediction time would teach the model
 something it can't use live.
 
 Why our own Elo instead of the sportsbook moneyline: there is no history of pre-match odds (bo3.gg only
@@ -78,18 +79,23 @@ way in training and live.
 
 ## 3. Model
 
-- **Target:** maps 1-2 kills (and a second tree for headshots), for every player in every BO3/BO5 that
-  reached map 2. A *regression* tree, because there are no historical lines to label over/under.
+- **Target:** maps 1-2 kills (and a second model for headshots), for every player in every BO3/BO5 that
+  reached map 2. A *regression* model, because there are no historical lines to label over/under.
+- **Model:** gradient boosting (`HistGradientBoostingRegressor`). It is hundreds of small decision trees,
+  each fitted to the errors the earlier ones still make, added up in small steps. Early stopping ends
+  training once new trees stop helping. A single decision tree is still available (`MODEL = "tree"`, or
+  `backtest <csv> tree`) for comparison.
 - **Over/under probability:** each validation result gives a held-out error `z = (actual − predicted) / √predicted`.
   The z values are centred so a level shift between periods doesn't bias every pick. P(over 30.5) is
   the share of z values for which `projection + z·√projection` lands above 30.5. Counting stats spread
   like √mean, so one z distribution fits 15-kill and 35-kill players alike. Whole-number lines
   (PrizePicks posts 35, 27, ...) get push handling.
-- **Tuning:** `max_depth` 3-10 and `min_samples_leaf` 25-400, chosen on a validation slice by MAE.
+- **Tuning:** loss (squared error or Poisson, which suits counts), learning rate 0.05 or 0.1, and 15 or
+  31 leaves per tree, chosen on a validation slice by MAE. Both stats chose Poisson, 0.05 and 15.
 - **Split by time:** oldest 70% train, next 15% validate (tuning and the error spread), newest 15% test.
-- **What `train` prints:** test MAE of the tree versus the naive "2 × 20-map average", a stand-in-line
+- **What `train` prints:** test MAE of the model versus the naive "2 × 20-map average", a stand-in-line
   hit rate (optimistic, since real books are sharper than a 20-map average), Brier score versus a coin
-  flip, and the top features.
+  flip, and the top features (how much the test error rises when each feature is shuffled).
 
 ### Results on real data
 
@@ -98,18 +104,35 @@ Trained on bo3.gg data from July 2025 to October 2026, about 90,000 player-serie
 
 | | Kills, maps 1-2 | Headshots, maps 1-2 |
 |---|---|---|
-| Tree mean absolute error | 6.09 | 3.87 |
-| Naive "2 × 20-map average" | 6.34 | 3.97 |
-| Brier score on the stand-in line (0.250 = coin flip) | 0.237 | 0.241 |
-| Most important features | kills per round, win probability, map factor, opponent Elo | 20-map headshots, HS% |
+| **Gradient boosting**, mean absolute error | **6.03** | **3.83** |
+| Single decision tree | 6.08 | 3.87 |
+| Naive "2 × 20-map average" | 6.33 | 3.97 |
+| Gain over the tree, paired 95% band | 0.054 ± 0.018 | 0.035 ± 0.011 |
+| Brier on the stand-in line, boosting / tree (0.250 = coin flip) | 0.235 / 0.237 | 0.238 / 0.241 |
+| Distinct projections on the 13,618 test rows, boosting / tree | 6,768 / 54 | 7,184 / 56 |
+| Most important features | kills per round, map factor, win probability, opponent Elo | 20-map headshots, HS% |
+
+Boosting beats the single tree on both stats by a small margin that the paired test says is real. It
+also gives every player their own projection: the tree put everyone into about 55 groups that shared one
+number each.
+
+Backtest on stand-in lines (6,802 lines on real September-October series, trained on data before
+September), boosting vs tree:
+
+| | Gradient boosting | Single tree |
+|---|---|---|
+| Hit rate (±2.3 points) | 61.4% | 60.7% |
+| ROI | 14.2% | 12.8% |
+| Hit rate on bets with 10%+ edge | 71.3% | 67.0% |
+
+The stand-in lines are softer than real books, so only the comparison means anything, and the overall
+gap is inside the noise. Both models also predicted P(over) about 5 points too low in that period,
+because kill levels rose after their training cutoff. Real PickFinder lines are the deciding test.
 
 On the 2026-10-30 slate (156 lines), projections averaged within 0.03 kills and 0.21 headshots of the
 books' lines (standard deviations 1.5 and 1.4). The model agrees with the books on level, so any edge
 lives in disagreements of 1-2 kills. That is also why the stand-in hit rate (about 60%) is no guide to
 real profit.
-
-A single tree also gives every player in the same leaf an identical projection. Gradient boosting
-(next steps) removes that coarseness.
 
 ## 4. Current lines
 
@@ -202,8 +225,8 @@ Next steps, in order of value:
 
 - **A classifier trained on real lines.** Once a few thousand graded lines exist, train it on
   `(features, line) → over?`.
-- **A stronger model.** Swap `DecisionTreeRegressor` for `HistGradientBoostingRegressor`. It is a
-  one-line change and is usually more accurate.
+- **Monthly walk-forward refits in the backtest.** It trains once, before the first graded line, so later
+  lines use a model that is months old. The calibration drift above is the symptom.
 
 ## 7. Known limitations
 

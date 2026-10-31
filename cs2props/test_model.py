@@ -70,6 +70,7 @@ def test_train_then_predict(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "data").mkdir()
     fake_maps(400).to_csv("data/maps.csv", index=False)
+    model.compare()  # both model kinds still fit on the same split
     model.train()
     when = "2026-01-01T00:00:00Z"
     pd.DataFrame([  # the book calls player 'max' "MaxOff" and the team "Team Alpha Esports"
