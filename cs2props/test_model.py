@@ -123,30 +123,34 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
 def test_pickfinder_history_rows():
     from cs2props import pickfinder
 
-    def game(start, vs, abbr, kills, score=(2, 0), **extra):
-        return dict(startTime=start, team="Nemiga", vs=vs, vsAbbr=abbr, scores=[dict(score=score[0]), dict(score=score[1])],
-                    periodStats=[dict(kills=k, headshots=k // 2) for k in kills], **extra)
+    def game(start, vs, vs_id, kills, score=(2, 0)):
+        return dict(startTime=start, team="G2", vs=vs, vsId=vs_id, scores=[dict(score=score[0]), dict(score=score[1])],
+                    periodStats=[dict(kills=k, headshots=k // 2) for k in kills])
 
-    def prop(start, opp, abbr, line=27.5, outcomes=None):
-        return dict(stat="Maps 1-2 Kills", line=line, start_date=start, team=dict(name="Nemiga"),
-                    opponent=dict(name=opp, abbreviation=abbr),
-                    apps=dict(prizepicks=dict(outcomes=outcomes or dict(over=dict(price=-115), under=dict(price=-110)))))
+    def side(price, link=None, modifier=""):
+        return dict(price=price, modifier=modifier, deep_link=link and dict(desktop=link))
 
-    games = [game("2025-10-30 12:02:35.000Z", "Vitality", "VIT", [17, 13], lines={"Maps 1-2 Kills": 27.5}),
-             game("2025-09-07 11:07:00.000Z", "Copenhagen Wolves", "CW", [15, 15]),   # same-day rematch ...
-             game("2025-09-07 08:06:00.000Z", "Copenhagen Wolves", "CW", [20, 17]),   # ... the one at 08:00
-             game("2025-09-01 12:00:00.000Z", "Sat out", "SO", [20, 20], score=(2, 1)),  # missed a map: not maps 1-2
-             game("2025-10-28 12:00:00.000Z", "Bo1 side", "X", [20])]
-    props = [prop("2025-10-30T12:00:00Z", "Team Vitality", "VITALITY"),        # abbreviations differ: match by name
-             prop("2025-09-07T08:00:00Z", "Copenhagen Wolves", "CW"),
-             prop("2025-10-31T11:00:00Z", "FURIA", "FURIA"),                    # result not logged yet: no row
-             prop("2025-09-01T12:00:00Z", "Sat out", "SO"),
-             prop("2025-10-30T12:00:00Z", "Vitality", "VIT", line=33.5,         # demon: over only, can't bet under
-                  outcomes=dict(over=dict(price=-110, modifier="demon")))]
-    rows = pickfinder.player_rows(dict(player_name="KaiR0N", team=dict(name="New team")), games, props,
-                                  pd.Timestamp("2025-05-01", tz="UTC"))
-    assert [(r["source"], r["opponent"], r["line"], r["actual"], r["team"]) for r in rows] == [
-        ("gamelog", "Vitality", 27.5, 30, "Nemiga"),
-        ("props", "Team Vitality", 27.5, 30, "Nemiga"),
-        ("props", "Copenhagen Wolves", 27.5, 37, "Nemiga")]
-    assert (rows[1]["book"], rows[1]["over_odds"], rows[1]["under_odds"]) == ("prizepicks", -115, -110)
+    def entry(key, line, **apps):
+        return dict(matchKey=key, stat="Maps 1-2 Kills", line=line, apps=apps)
+
+    pp = "https://app.prizepicks.com/?projections=16194603-{}-28.5"
+    games = [game("2025-10-26 16:34:00.000Z", "DENDELE CS", "138988", [16, 14, 20], score=(2, 1)),  # played all 3
+             game("2025-11-02 05:31:03.000Z", "PARIVISION", "133719", [12, 8]),        # scheduled 11/01 ET
+             game("2025-09-07 08:06:00.000Z", "Copenhagen Wolves", "500", [20, 17]),   # two series vs the same
+             game("2025-09-07 11:07:00.000Z", "Copenhagen Wolves", "500", [15, 15]),   # ... team that day
+             game("2025-09-01 12:00:00.000Z", "Sat out", "77", [20, 20], score=(2, 1))]  # missed a map
+    hist = {"Maps 1-2 Kills": [
+        entry("2025-10-26-138988", 26.5,  # PrizePicks' own line (28.5) is in its link; Underdog's is the entry's
+              prizepicks=dict(outcomes=dict(over=side(-119, pp.format("o")), under=side(-119, pp.format("u")))),
+              underdog=dict(outcomes=dict(over=side(-115), under=side(-115))),
+              goblin=dict(outcomes=dict(over=side(-155, modifier="goblin")))),
+        entry("2025-11-01-133719", 26.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-110)))),
+        entry("2025-11-09-133719", 25.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-115)))),  # not played
+        entry("2025-09-07-500", 27.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-115)))),  # ambiguous
+        entry("2025-09-01-77", 27.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-115)))),
+        entry("2025-01-05-138988", 27.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-115))))]}  # too old
+    rows = pickfinder.player_rows(dict(player_name="huNter-"), games, hist, pd.Timestamp("2025-05-01").date())
+    assert [(r["book"], r["opponent"], r["line"], r["actual"], r["under_odds"]) for r in rows] == [
+        ("prizepicks", "DENDELE CS", 28.5, 30, -119), ("underdog", "DENDELE CS", 26.5, 30, -115),
+        ("underdog", "PARIVISION", 26.5, 20, -110)]
+    assert rows[0]["start_time"].startswith("2025-10-26T16:34") and rows[0]["team"] == "G2"

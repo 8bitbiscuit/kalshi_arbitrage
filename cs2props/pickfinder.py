@@ -1,17 +1,17 @@
-"""PickFinder (needs your login): prop history for backtesting, plus a helper that shows its API calls.
+"""PickFinder (needs your login): prop history for backtesting, plus a helper that records its requests.
 
     python -m cs2props.pickfinder history            # data/prop_history.csv -> python -m cs2props.model backtest
     python -m cs2props.pickfinder discover KaiR0N    # save the data requests a player page makes, for debugging
 
 Set PICKFINDER_EMAIL and PICKFINDER_PASSWORD; a Firefox window opens and logs in.
 
-What is known about PickFinder's API:
-  - GET /props?sport=cs2 lists current props, which is the only way found to get player ids.
-  - GET /players/{id}/gamelog has every series with per-map stats (the results). For some sports it
-    also has `lines` with the archived line, but a logged-in CS2 gamelog has none (checked 2026-11-02).
-  - GET /players/{id}/props returns only the player's current props, not past ones (checked 2026-11-02).
-So the CS2 "Prop History" panel loads its lines from another request. `discover` records every
-PickFinder data request a player page makes, so that request and its response can be found.
+Where the data comes from (found with `discover` on 2026-11-02):
+  - api-v2 GET /props?sport=cs2 lists current props: player ids, names and OpticOdds ids (player_oo_id).
+  - api-v2 GET /players/{player_id}/gamelog has every series with per-map stats: the results.
+  - www GET /api/players/{player_oo_id}/props/historical?stat=Maps 1-2 Kills is the Prop History panel:
+    one entry per past match with the line, each book's prices and both teams' implied win chances. Its
+    matchKey is "<scheduled US Eastern date>-<opponent id>", and the opponent id is the gamelog's vsId.
+    It is a website route, so it is called from inside the logged-in page (it uses cookies, not a token).
 """
 import json
 import os
@@ -19,11 +19,11 @@ import re
 import sys
 import time
 from contextlib import contextmanager
+from urllib.parse import quote, urlencode
 
 import pandas as pd
 
 from cs2props.lines import COLS, http
-from cs2props.model import team_key
 
 API, SITE = "https://api-v2.pickfinder.app", "https://www.pickfinder.app"
 MARKETS = {"Maps 1-2 Kills": "kills", "Maps 1-2 HS": "headshots"}  # PickFinder's display names
@@ -32,7 +32,8 @@ PROPS_CSV, DEBUG_DIR = "data/prop_history.csv", "data/pickfinder_debug"
 
 @contextmanager
 def session():
-    """Log in with Firefox and yield get(path_or_url, **params), which sends a fresh session token."""
+    """Log in with Firefox. Yields get(path_or_url, **params) for the api-v2 API (sends a fresh session
+    token), with get.page(path_or_url, **params) for www.pickfinder.app routes and get.driver."""
     from selenium import webdriver
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
@@ -57,7 +58,18 @@ def session():
             r.raise_for_status()  # a rejected token must fail loudly, not look like "no data"
             return r.json()
 
-        get.driver = driver
+        def page(path, **params):
+            time.sleep(1)
+            url = (path if path.startswith("http") else SITE + path) + (
+                "?" + urlencode(params, quote_via=quote) if params else "")
+            status, text = driver.execute_async_script(
+                "const done = arguments[1]; fetch(arguments[0], {credentials: 'include'})"
+                ".then(async r => done([r.status, await r.text()])).catch(e => done([0, String(e)]))", url)
+            if status != 200:
+                raise RuntimeError(f"HTTP {status} from {url}: {text[:200]}")
+            return json.loads(text)
+
+        get.page, get.driver = page, driver
         yield get
     finally:
         driver.quit()
@@ -77,20 +89,22 @@ def current_props(get):
 def series_results(games):
     """Series with 2+ maps where the player played every map, so periodStats[:2] really are maps 1 and 2
     (the gamelog leaves out maps a player sat out)."""
-    return [{**{stat: sum(m.get(stat) or 0 for m in g["periodStats"][:2]) for stat in MARKETS.values()},
-             "start": pd.to_datetime(g["startTime"], utc=True), "team": g.get("team"), "vs": g.get("vs"),
-             "abbr": (g.get("vsAbbr") or "").upper(), "lines": g.get("lines") or {}}
-            for g in games if len(g.get("periodStats") or []) >= 2
-            and len(g["periodStats"]) == sum(x.get("score") or 0 for x in g.get("scores") or [])]
+    out = []
+    for g in games:
+        maps = g.get("periodStats") or []
+        if len(maps) >= 2 and len(maps) == sum(x.get("score") or 0 for x in g.get("scores") or []):
+            start = pd.to_datetime(g["startTime"], utc=True)
+            out.append({**{stat: sum(m.get(stat) or 0 for m in maps[:2]) for stat in MARKETS.values()},
+                        "start": start, "et_date": start.tz_convert("America/New_York").date(),
+                        "team": g.get("team"), "vs": g.get("vs"), "vs_id": str(g.get("vsId"))})
+    return out
 
 
-def lookup(results, start, opponent):
-    """The prop's own series: same opponent (abbreviation, else normalised name), starting between 3 h before
-    and 12 h after the listed time (matches start late, rarely early); the nearest one if several."""
-    abbr, name = (opponent.get("abbreviation") or "").upper(), team_key(opponent.get("name"))
-    same = [r for r in results if pd.Timedelta(hours=-3) <= r["start"] - start <= pd.Timedelta(hours=12)
-            and ((abbr and abbr == r["abbr"]) or name == team_key(r["vs"]))]
-    return min(same, key=lambda r: abs(r["start"] - start)) if same else None
+def book_line(app, default):
+    """A book's own line: PrizePicks links carry it (".../?projections=16194603-o-28.5"); others use the entry's."""
+    link = ((app.get("outcomes") or {}).get("over") or {}).get("deep_link") or {}
+    found = re.search(r"-o-(\d+(?:\.\d+)?)$", str(link.get("desktop") or link.get("ios") or ""))
+    return float(found.group(1)) if found else default
 
 
 def main_prices(app):
@@ -102,37 +116,34 @@ def main_prices(app):
     return None
 
 
-def player_rows(it, games, props, since):
-    """Prop-history rows (backtest schema + actual) for one player from their gamelog and props responses."""
-    name, results, rows = it["player_name"], series_results(games), []
-    for r in results:  # lines archived in the gamelog itself
-        if r["start"] >= since:
-            for display, stat in MARKETS.items():
-                if r["lines"].get(display) is not None:
-                    rows.append(dict(book="pickfinder", player=name, team=r["team"], opponent=r["vs"], stat=stat,
-                                     maps="1-2", line=r["lines"][display], start_time=r["start"].isoformat(),
-                                     actual=r[stat], source="gamelog"))
-    now = pd.Timestamp.now(tz="UTC")
-    for p in props:  # past prop items, one row per book offering the main line
-        if p.get("stat") not in MARKETS or p.get("isAltLine") or not p.get("start_date"):
-            continue
-        start, opp = pd.to_datetime(p["start_date"], utc=True), p.get("opponent") or {}
-        r = lookup(results, start, opp)
-        if not (since <= start < now) or r is None:  # result not logged yet: picked up by a later run
-            continue
-        for book, app in (p.get("apps") or {}).items():
-            prices = main_prices(app)
-            if prices:
-                rows.append(dict(book=book, player=name, team=(p.get("team") or {}).get("name") or r["team"],
-                                 opponent=opp.get("name"), stat=MARKETS[p["stat"]], maps="1-2", line=p["line"],
-                                 over_odds=prices[0], under_odds=prices[1], start_time=start.isoformat(),
-                                 actual=r[MARKETS[p["stat"]]], source="props"))
+def player_rows(it, games, history, since):
+    """Backtest rows for one player: every past main line (one row per book) with its series' result.
+
+    history maps a market name to its /props/historical response. An entry's series is the gamelog series
+    against the same opponent id within a day of the scheduled date. Entries with no such series (not played
+    yet, missing, the player sat out a map) or with two equally close ones are skipped, not guessed."""
+    results, rows = series_results(games), []
+    for display, entries in history.items():
+        for h in entries:
+            day, opp_id = h["matchKey"].rsplit("-", 1)
+            day = pd.Timestamp(day).date()
+            gaps = {id(r): abs((r["et_date"] - day).days) for r in results if r["vs_id"] == opp_id}
+            near = [r for r in results if gaps.get(id(r), 9) <= 1 and gaps[id(r)] == min(gaps.values())]
+            if day < since or len(near) != 1:
+                continue
+            r = near[0]
+            for book, app in (h.get("apps") or {}).items():
+                prices = main_prices(app)
+                if prices:
+                    rows.append(dict(book=book, player=it["player_name"], team=r["team"], opponent=r["vs"],
+                                     stat=MARKETS[display], maps="1-2", line=book_line(app, h["line"]),
+                                     over_odds=prices[0], under_odds=prices[1], start_time=r["start"].isoformat(),
+                                     actual=r[MARKETS[display]]))
     return rows
 
 
 def history(months=6):
-    since = pd.Timestamp.now(tz="UTC") - pd.DateOffset(months=int(months))
-    os.makedirs(DEBUG_DIR, exist_ok=True)
+    since = (pd.Timestamp.now(tz="UTC") - pd.DateOffset(months=int(months))).date()
     rows = []
     with session() as get:
         # ponytail: only players with a prop up right now; re-run on other days to cover more players.
@@ -141,28 +152,21 @@ def history(months=6):
         for n, (pid, it) in enumerate(players.items(), 1):
             try:
                 games = get(f"/players/{pid}/gamelog")
-                props = get(f"/players/{pid}/props")
+                games = games if isinstance(games, list) else games.get("games", [])
+                hist = {d: get.page(f"/api/players/{it['player_oo_id']}/props/historical", stat=d) for d in MARKETS}
+                new = player_rows(it, games, hist, since)
             except Exception as e:  # one bad player must not lose the rest
                 print(f"{it['player_name']}: FAILED {e!r}", file=sys.stderr)
                 continue
-            if n == 1:  # keep one raw example of each response for debugging
-                for nm, body in (("gamelog", games), ("props", props)):
-                    with open(f"{DEBUG_DIR}/example_{nm}.json", "w") as f:
-                        json.dump(body, f)
-            games = games if isinstance(games, list) else games.get("games", [])
-            props = props.get("items", []) if isinstance(props, dict) else props
-            new = player_rows(it, games, props, since)
             rows += new
-            print(f"{n}/{len(players)} {it['player_name']}: {len(games)} games, {len(new)} past lines")
-    cols = COLS + ["actual", "source"]
-    df = pd.DataFrame(rows, columns=cols).drop_duplicates(["book", "player", "stat", "start_time", "line"])
+            print(f"{n}/{len(players)} {it['player_name']}: {sum(map(len, hist.values()))} past lines listed, "
+                  f"{len(new)} rows with results")
+    key = ["book", "player", "stat", "start_time", "line"]
+    df = pd.DataFrame(rows, columns=COLS + ["actual"]).drop_duplicates(key)
     if os.path.exists(PROPS_CSV):  # keep earlier runs' lines (other players, older dates); new rows win
-        df = pd.concat([df, pd.read_csv(PROPS_CSV)]).drop_duplicates(["book", "player", "stat", "start_time", "line"])
+        df = pd.concat([df, pd.read_csv(PROPS_CSV)]).drop_duplicates(key)
     df.to_csv(PROPS_CSV, index=False)
     print(f"{len(df)} past lines in {PROPS_CSV}; next: python -m cs2props.model backtest")
-    if not rows:
-        print("No past lines were in the gamelog or props responses. Run `python -m cs2props.pickfinder discover "
-              "<player>` and look in data/pickfinder_debug/ for the response that holds them.")
 
 
 # Runs in the page: keeps the URL and response of every fetch/XHR from now on, and lifts the browser's
@@ -214,9 +218,7 @@ def discover(player):
         for url in dict.fromkeys(loaded):
             if url not in calls and pickfinder_data(url):
                 try:
-                    body = json.dumps(get(url)) if url.startswith(API) else driver.execute_async_script(
-                        "const done = arguments[1]; fetch(arguments[0], {credentials: 'include'})"
-                        ".then(r => r.text()).then(done).catch(e => done('ERROR ' + e))", url)
+                    body = json.dumps(get(url) if url.startswith(API) else get.page(url))
                 except Exception as e:
                     body = f"ERROR {e!r}"
                 calls[url] = {"url": url, "status": None, "body": body}
