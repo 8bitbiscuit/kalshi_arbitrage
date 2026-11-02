@@ -58,7 +58,8 @@ after the file to test the single tree.
 python -m cs2props.model backtest
 ```
 
-If `history` finds no past lines, record what a player page loads. The responses go to `data/pickfinder_debug/`.
+If `history` finds no past lines, record what a player page loads. Open Prop History in the Firefox
+window, wait for its cards, then press Enter in the terminal. The responses go to `data/pickfinder_debug/`.
 
 ```bash
 python -m cs2props.pickfinder discover KaiR0N

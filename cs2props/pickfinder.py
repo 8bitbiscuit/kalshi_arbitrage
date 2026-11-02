@@ -1,17 +1,17 @@
 """PickFinder (needs your login): prop history for backtesting, plus a helper that shows its API calls.
 
     python -m cs2props.pickfinder history            # data/prop_history.csv -> python -m cs2props.model backtest
-    python -m cs2props.pickfinder discover KaiR0N    # save the API calls a player page makes, for debugging
+    python -m cs2props.pickfinder discover KaiR0N    # save the data requests a player page makes, for debugging
 
 Set PICKFINDER_EMAIL and PICKFINDER_PASSWORD; a Firefox window opens and logs in.
 
-What PickFinder's public site code shows (this could not be run here without a login):
+What is known about PickFinder's API:
   - GET /props?sport=cs2 lists current props, which is the only way found to get player ids.
   - GET /players/{id}/gamelog has every series with per-map stats (the results). For some sports it
-    also has `lines`, keyed by market name ("Maps 1-2 Kills", "Maps 1-2 HS"), with the archived line.
-  - GET /players/{id}/props may also return past props (line, each book's prices, moneyline %).
-The CS2 "Prop History" panel's own request lives in code behind the login. If `history` finds no
-past lines, run `discover` once and look in data/pickfinder_debug/ for the response holding them.
+    also has `lines` with the archived line, but a logged-in CS2 gamelog has none (checked 2026-11-02).
+  - GET /players/{id}/props returns only the player's current props, not past ones (checked 2026-11-02).
+So the CS2 "Prop History" panel loads its lines from another request. `discover` records every
+PickFinder data request a player page makes, so that request and its response can be found.
 """
 import json
 import os
@@ -165,28 +165,75 @@ def history(months=6):
               "<player>` and look in data/pickfinder_debug/ for the response that holds them.")
 
 
-def discover(player, seconds=90):
-    """Open a player's page, let you click its Prop History, then save every API response it made."""
+# Runs in the page: keeps the URL and response of every fetch/XHR from now on, and lifts the browser's
+# 250-entry request log so later requests aren't dropped from it.
+RECORD_JS = """
+performance.setResourceTimingBufferSize(100000);
+window.__pf = window.__pf || [];
+if (!window.__pfHooked) {
+  window.__pfHooked = true;
+  const keep = (url, status, body) => window.__pf.push({url: new URL(url, location.href).href, status, body: String(body)});
+  const fetch0 = window.fetch;
+  window.fetch = async (...args) => {
+    const res = await fetch0(...args);
+    res.clone().text().then(t => keep((args[0] && args[0].url) || args[0], res.status, t)).catch(() => {});
+    return res;
+  };
+  const open0 = XMLHttpRequest.prototype.open, send0 = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) { this.__url = url; return open0.call(this, method, url, ...rest); };
+  XMLHttpRequest.prototype.send = function (...args) {
+    this.addEventListener("load", () => { try { keep(this.__url, this.status, this.responseText); } catch (e) {} });
+    return send0.apply(this, args);
+  };
+}
+"""
+
+
+def pickfinder_data(url):
+    """PickFinder's own data requests (API or website routes), not the login service, analytics or assets."""
+    host = re.sub(r"^https?://([^/]+).*", r"\1", url)
+    return (host == "pickfinder.app" or host.endswith(".pickfinder.app")) and not host.startswith("clerk.")
+
+
+def discover(player):
+    """Open a player's page, let you open Prop History, then save every PickFinder data response it made."""
     os.makedirs(DEBUG_DIR, exist_ok=True)
     with session() as get:
         key = re.sub(r"[^a-z0-9]", "", player.lower())
         pid = next((it["player_id"] for it in current_props(get)
                     if re.sub(r"[^a-z0-9]", "", it["player_name"].lower()) == key), player)
-        get.driver.get(f"{SITE}/players/cs2/{pid}")
-        print(f"In the Firefox window, pick 'Maps 1-2 Kills' and open Prop History. Recording for {seconds} s ...")
-        time.sleep(int(seconds))
-        urls = get.driver.execute_script(
-            "return [...new Set(performance.getEntriesByType('resource').map(e => e.name))]")
-        for i, url in enumerate(u for u in urls if u.startswith(API)):
+        driver = get.driver
+        driver.get(f"{SITE}/players/cs2/{pid}")
+        driver.execute_script(RECORD_JS)
+        input("In the Firefox window: choose 'Maps 1-2 Kills', open the Prop History panel and wait until its\n"
+              "cards show. Then press Enter here. ")
+        calls = {c["url"]: c for c in driver.execute_script("return window.__pf || []")}
+        # Requests made while the page first loaded, before recording began: fetch them again.
+        loaded = driver.execute_script("return performance.getEntriesByType('resource').filter(e => "
+                                       "['fetch', 'xmlhttprequest'].includes(e.initiatorType)).map(e => e.name)")
+        for url in dict.fromkeys(loaded):
+            if url not in calls and pickfinder_data(url):
+                try:
+                    body = json.dumps(get(url)) if url.startswith(API) else driver.execute_async_script(
+                        "const done = arguments[1]; fetch(arguments[0], {credentials: 'include'})"
+                        ".then(r => r.text()).then(done).catch(e => done('ERROR ' + e))", url)
+                except Exception as e:
+                    body = f"ERROR {e!r}"
+                calls[url] = {"url": url, "status": None, "body": body}
+        for old in os.listdir(DEBUG_DIR):  # don't mix in files from an earlier run
+            if old.startswith("call_"):
+                os.remove(os.path.join(DEBUG_DIR, old))
+        for i, c in enumerate(c for c in calls.values() if pickfinder_data(c["url"])):
             try:
-                body = get(url)
-            except Exception as e:
-                body = {"error": repr(e)}
+                c["body"] = json.loads(c["body"])
+            except (TypeError, ValueError):
+                pass
             with open(f"{DEBUG_DIR}/call_{i:02d}.json", "w") as f:
-                json.dump({"url": url, "body": body}, f)
-            text = json.dumps(body)
+                json.dump(c, f)
+            text = json.dumps(c["body"])
             has_line = '"line' in text
-            print(f"call_{i:02d}.json  {len(text):>8} bytes  has 'line': {has_line}  {url}")
+            print(f"call_{i:02d}.json  {len(text):>8} bytes  has 'line': {has_line!s:5}  {c['url']}")
+    print("Send the call_*.json whose response holds the past lines (look for 'line' and the actual results).")
 
 
 if __name__ == "__main__":
