@@ -212,11 +212,13 @@ The code also shows lines being archived per game ("lines are archived from this
 market names "Maps 1-2 Kills" and "Maps 1-2 HS". But the request behind the CS2 Prop History panel is in
 code that only loads after login. The game log fetched without a login had no lines.
 
-`history` checks the two likely places: the game log's `lines` and past items from `/players/{id}/props`. It
-saves one raw example of each response to `data/pickfinder_debug/`. If it finds no past lines, run
-`python -m cs2props.pickfinder discover KaiR0N`. That opens the player page, lets you click Prop History,
-and saves every API response the page made. One of those holds the lines, and adapting `player_rows()` to
-it is a small change.
+`history` checks the two likely places: the game log's `lines` and past items from `/players/{id}/props`.
+A logged-in run on 2026-11-02 showed neither holds past CS2 lines: the game log has results only, and
+`/players/{id}/props` returns only current props. The Prop History panel must load its lines from a
+third request. To find it, run `python -m cs2props.pickfinder discover KaiR0N`. It opens the player page,
+records every PickFinder data request (API and website routes, with responses) while you open Prop
+History, and saves them to `data/pickfinder_debug/` when you press Enter. Adapting `player_rows()` to the
+response that holds the lines is then a small change.
 
 Scraping many player histories is heavier use than the app's own pages make. The code waits 1 s per
 request, but check PickFinder's terms before running it often.
