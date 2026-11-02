@@ -205,20 +205,35 @@ are two sources:
 Only trust the picks if the hit rate beats breakeven by more than the band. At 500 bets the band is
 about ±4.5 points, so a 58% hit rate at a 54.3% breakeven is not yet proof.
 
-**PickFinder status.** The scraper is untested because it needs your login. PickFinder's public code
-confirms where the results are: per-player game logs with per-map kills and headshots. Parsing a real
-log reproduces your screenshot's results (KaiR0N: 30 kills vs Vitality on 10/30, 29 vs FUT on 10/29).
-The code also shows lines being archived per game ("lines are archived from this season on") under the
-market names "Maps 1-2 Kills" and "Maps 1-2 HS". But the request behind the CS2 Prop History panel is in
-code that only loads after login. The game log fetched without a login had no lines.
+**How `pickfinder history` gets past lines.** A logged-in `discover` run on 2026-11-02 found the request
+behind the Prop History panel. It is a website route, keyed by the player's OpticOdds id:
 
-`history` checks the two likely places: the game log's `lines` and past items from `/players/{id}/props`.
-A logged-in run on 2026-11-02 showed neither holds past CS2 lines: the game log has results only, and
-`/players/{id}/props` returns only current props. The Prop History panel must load its lines from a
-third request. To find it, run `python -m cs2props.pickfinder discover KaiR0N`. It opens the player page,
-records every PickFinder data request (API and website routes, with responses) while you open Prop
-History, and saves them to `data/pickfinder_debug/` when you press Enter. Adapting `player_rows()` to the
-response that holds the lines is then a small change.
+```
+https://www.pickfinder.app/api/players/{player_oo_id}/props/historical?stat=Maps%201-2%20Kills
+```
+
+It returns one entry per past match with the line, each book's prices and both teams' implied win
+chances, but no result. Its match key is the scheduled US Eastern date plus the opponent's id, which is
+the same id the player's game log (`/players/{id}/gamelog`) uses. So each entry is joined to the series
+against that opponent within a day of that date, and the result is the sum of maps 1 and 2 from the
+game log:
+
+- **Skipped, not guessed:** entries with no such series (not played yet, or the player sat out a map) or
+  two equally close ones.
+- **Each book's own line:** a book's line can differ from the entry's. PrizePicks' is read from its link,
+  e.g. 28.5 where the entry says Underdog's 26.5.
+- **Main lines only:** goblin, demon and other one-sided lines are dropped.
+
+Checked on huNter's real responses: 20 of his 22 entries matched a series. The other two were an
+unplayed match and one missing from his game log. The backtest then matched all 21 resulting lines to
+bo3.gg, and PickFinder's results agreed with bo3.gg on all 21. The scraper's login and paging around
+these calls are still untested end to end, because they need your login.
+
+PickFinder's prices for pick'em apps are its per-pick equivalents: -119 for PrizePicks, -107 to -115 for
+Underdog. The backtest uses them as given.
+
+`discover` stays available for when PickFinder changes its site. It records every PickFinder data request
+a player page makes, with responses, while you click around, and saves them to `data/pickfinder_debug/`.
 
 Scraping many player histories is heavier use than the app's own pages make. The code waits 1 s per
 request, but check PickFinder's terms before running it often.
