@@ -54,8 +54,9 @@ python -m cs2props.pickfinder history
 ```
 
 Grade the model on those lines. Add `data/lines_history.csv` to use your own archive instead, and `tree`
-after the file to test the single tree. With 300+ graded lines it also learns a calibrator from them
-(`data/calibrator.joblib`), which `predict` then uses.
+after the file to test the single tree. With 300+ player-series from 30+ matches it also learns a
+calibrator from them (`data/calibrator.joblib`). It is saved only if it beats the raw model on later
+matches, and `predict` then uses it.
 
 ```bash
 python -m cs2props.model backtest

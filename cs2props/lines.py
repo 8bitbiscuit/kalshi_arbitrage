@@ -104,7 +104,14 @@ def pickfinder():
     from cs2props.pickfinder import current_props, main_prices, session  # Selenium login; see pickfinder.py
 
     with session() as get:
+        seen = set()
         for it in current_props(get):
+            match = ((it.get("team") or {}).get("name"), (it.get("opponent") or {}).get("name"), it.get("start_date"))
+            win = win_share(it.get("team_ml_percent"), it.get("opponent_ml_percent"))
+            if win is not None and match not in seen:  # one odds-only row per match: the model shares it with
+                seen.add(match)                         # that match's PrizePicks/Underdog/Sleeper lines
+                yield dict(book="pickfinder", player=it["player_name"], team=match[0], opponent=match[1],
+                           stat="match_odds", maps="", start_time=match[2], win_market=win)
             if it.get("isAltLine"):
                 continue
             for book, app in (it.get("apps") or {}).items():

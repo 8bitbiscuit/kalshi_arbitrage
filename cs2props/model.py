@@ -22,14 +22,16 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import log_loss
 from sklearn.tree import DecisionTreeRegressor
 
 MAPS_CSV, LINES_CSV, PICKS_CSV = "data/maps.csv", "data/lines.csv", "data/picks.csv"
 PROPS_CSV, BACKTEST_CSV, CAL_FILE = "data/prop_history.csv", "data/backtest.csv", "data/calibrator.joblib"
 STATS = ("kills", "headshots")
 FEATURES = ["kills_l20", "kills_l5", "headshots_l20", "hs_pct", "kpr", "adr_l20", "kast_l20", "rounds_l20",
-            "maps_played", "map_factor", "map_kpr", "win_prob", "elo_opp", "closeness", "exp_rounds", "opp_rounds",
-            "exp_kills_m12", "exp_hs_m12"]
+            "maps_played", "map_factor", "map_kpr", "win_prob", "elo_opp", "opp_rounds", "exp_kills_m12", "exp_hs_m12"]
+# Closeness and expected rounds per map enter through exp_kills_m12 only: as separate inputs they made
+# projections jump by kills on a 0.01 change in win probability, with no accuracy gain.
 # Rows lacking these are skipped (fewer than 5 maps of history). Other features may be NaN (e.g. a
 # missing ADR); scikit-learn trees handle NaN natively.
 NEED = {"kills": ["kills_l20", "kpr", "map_factor"], "headshots": ["kills_l20", "kpr", "map_factor", "hs_pct"]}
@@ -82,6 +84,8 @@ def map_rounds(p_map):
 
 def series_to_map(p_series):
     """Per-map win probability that gives this best-of-3 series win probability (p_s = p^2 (3 - 2p))."""
+    # ponytail: assumes best-of-3 (~99% of maps 1-2 series); best-of-5 finals come out slightly too lopsided,
+    # and no line feed says which format a match is.
     grid = np.linspace(0, 1, 1001)
     return pd.Series(np.interp(np.asarray(p_series, float), grid ** 2 * (3 - 2 * grid), grid),
                      index=getattr(p_series, "index", None))
@@ -165,8 +169,7 @@ def features(q, df):
     f["win_prob"] = 1 / (1 + 10 ** ((f.elo_opp - f.elo.fillna(1500.0)) / 400))  # per map, from our Elo
     if "win_market" in f:  # the market's series win probability, when the line came with one, beats our Elo
         f["win_prob"] = series_to_map(f.win_market).fillna(f.win_prob)
-    # How close the match should be, so how many rounds maps 1-2 last and how many kills that allows.
-    f["closeness"] = 1 - (2 * f.win_prob - 1).abs()
+    # How close the match should be sets how many rounds maps 1-2 last, and so how many kills they allow.
     f["exp_rounds"] = map_rounds(f.win_prob)
     f["exp_kills_m12"] = 2 * f.exp_rounds * f.map_kpr
     f["exp_hs_m12"] = f.exp_kills_m12 * f.hs_pct
@@ -330,18 +333,20 @@ def decide(out, cal=None):
         p = cal.predict_proba(cal_inputs(out[m]))[:, 1]
         out.loc[m, "p_over"], out.loc[m, "p_under"] = p * (1 - push), (1 - p) * (1 - push)
     be_over, be_under = out.over_odds.map(american_to_prob), out.under_odds.map(american_to_prob)
-    out["edge"] = np.maximum(out.p_over - be_over, out.p_under - be_under)
-    out["pick"] = np.select([out.p_over.isna(), out.p_over > be_over, out.p_under > be_under],
-                            ["NO DATA", "OVER", "UNDER"], "PASS")
+    over = out.p_over / (out.p_over + out.p_under)  # pushes are refunded, so only P(over | no push) matters
+    out["edge"] = np.maximum(over - be_over, (1 - over) - be_under)
+    out["pick"] = np.select([out.p_over.isna(), over > be_over, 1 - over > be_under], ["NO DATA", "OVER", "UNDER"], "PASS")
     return out
 
 
 def score(lines, df, bundles, cal=None):
     """Projection, P(over/under), edge and pick for maps 1-2 kill/headshot lines (start_time = as-of time)."""
-    lines = lines[lines.stat.isin(STATS) & (lines.maps.astype(str) == "1-2")].reset_index(drop=True)
+    lines = lines.reset_index(drop=True)
     lines["start_date"] = pd.to_datetime(lines.start_time, utc=True, format="ISO8601").fillna(pd.Timestamp.now(tz="UTC"))
-    lines = resolve(lines, df).reset_index(names="line_idx")
-    lines["win_market"] = match_odds(lines)
+    lines = resolve(lines, df)
+    lines["win_market"] = match_odds(lines)  # before filtering: any line of a match (or an odds-only row) can carry it
+    lines = lines[lines.stat.isin(STATS) & (lines.maps.astype(str) == "1-2")].reset_index(drop=True)
+    lines = lines.reset_index(names="line_idx")
     # Unmatched opponent names get NO DATA rather than being scored as an average team.
     known = lines[lines.player_id.notna() & (lines.opp_id != -1)].astype({"player_id": int, "team_id": int, "opp_id": int})
     f = features(known[["line_idx", "player_id", "team_id", "opp_id", "start_date", "win_market"]], df)
@@ -364,13 +369,17 @@ def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
     if any(b.get("features") != FEATURES for b in bundles.values()):
         sys.exit("The saved models use an older feature set. Run `python -m cs2props.model train` first.")
     cal = joblib.load(CAL_FILE) if os.path.exists(CAL_FILE) else None
-    out = score(pd.read_csv(lines_csv), df, bundles, cal).sort_values("edge", ascending=False)
+    if cal is not None and not (isinstance(cal, dict) and cal["features"] == FEATURES
+                                and cal["kind"] == bundles["kills"]["metrics"]["model"]):
+        print(f"Ignoring {CAL_FILE}: it was learned with another model or feature set. Re-run `backtest`.")
+        cal = None
+    out = score(pd.read_csv(lines_csv), df, bundles, cal and cal["cal"]).sort_values("edge", ascending=False)
     cols = ["book", "player", "matched", "team", "opponent", "stat", "line", "proj", "p_over", "p_under", "edge", "pick"]
     out.to_csv(PICKS_CSV, index=False)
     print(out[[c for c in cols if c in out]].round(3).to_string(index=False))
     print(f"\n{(out.pick == 'NO DATA').sum()} of {len(out)} lines had no usable history (check 'matched').")
-    print(f"P(over) is calibrated on real lines ({CAL_FILE})." if cal is not None else
-          "P(over) is the model's raw estimate: run `backtest` on real lines to learn a calibrator.")
+    print(f"P(over) is calibrated on {cal['series']} real player-series ({cal['source']}, through {cal['through']:%Y-%m-%d})."
+          if cal is not None else "P(over) is the model's raw estimate: run `backtest` on real lines to learn a calibrator.")
 
 
 def profit(odds):
@@ -401,8 +410,10 @@ def summary(g):
 
 
 def calibration(out):
-    d = out[out.result != "PUSH"].assign(bin=lambda d: pd.cut(d.p_over, [0, .3, .4, .5, .6, .7, 1]))
-    return d.groupby("bin", observed=True).agg(lines=("p_over", "size"), predicted=("p_over", "mean"),
+    """Predicted P(over | no push) vs how often lines actually went over, pushes left out."""
+    d = out[out.result != "PUSH"]
+    d = d.assign(p=d.p_over / (d.p_over + d.p_under), bin=lambda d: pd.cut(d.p, [0, .3, .4, .5, .6, .7, 1]))
+    return d.groupby("bin", observed=True).agg(lines=("p", "size"), predicted=("p", "mean"),
                                                actual=("result", lambda r: (r == "OVER").mean()))
 
 
@@ -417,8 +428,9 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     The calibrator is fitted on the earlier 60% of graded lines and judged on the later 40%.
     """
     df = load(maps_csv)
-    props = pd.read_csv(props_csv)
-    props = props[props.stat.isin(STATS) & (props.maps.astype(str) == "1-2")].reset_index(drop=True)
+    props = pd.read_csv(props_csv)  # odds-only rows (stat "match_odds") stay: score() shares them, then drops them
+    props = props[(props.stat.isin(STATS) & (props.maps.astype(str) == "1-2")) | (props.stat == "match_odds")]
+    props = props.reset_index(drop=True)
     props["start_date"] = pd.to_datetime(props.start_time, utc=True, format="ISO8601")
     props = resolve(props.dropna(subset=["start_date"]).reset_index(drop=True), df)
     res = series(df)[["player_id", "opp_id", "start_date", "kills_m12", "headshots_m12"]]
@@ -469,20 +481,38 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     print("\nCalibration (predicted P(over) vs actual over rate):\n" + calibration(out).round(3).to_string())
     print(f"\nper-line results saved to {BACKTEST_CSV}")
 
-    # Learn P(over) from the real lines themselves: fit on the earlier 60%, judge on the later 40%.
-    if len(out) < 300:
-        return print(f"\nOnly {len(out)} graded lines: at least 300 are needed to learn a calibrator.")
-    cut = int(0.6 * len(out))
-    cal, late = fit_calibrator(out.iloc[:cut]), out.iloc[cut:]
+    # Learn P(over) from the real lines themselves: fit on earlier matches, judge on later ones. Copies of a
+    # line at several books share one outcome, so the minimums count player-series and matches, not rows.
+    n_series = out.groupby(["player_id", "stat", "match_start"]).ngroups
+    n_matches = out.assign(pair=[tuple(sorted(x)) for x in zip(out.team_id, out.opp_id)]).groupby(
+        ["pair", "match_start"]).ngroups
+    if n_series < 300 or n_matches < 30:
+        return print(f"\n{n_series} player-series from {n_matches} matches: at least 300 and 30 are needed to learn "
+                     f"a calibrator. {CAL_FILE} was left as it was.")
+    cut = out.match_start.sort_values().iloc[int(0.6 * len(out))]  # whole matches on each side
+    early, late = out[out.match_start < cut], out[out.match_start >= cut]
+    cal = fit_calibrator(early)
     raw, calibrated = grade(decide(late)), grade(decide(late, cal))
-    print(f"\nCalibrator learned on the first {cut} lines, tested on the last {len(late)} "
-          f"({late.start_date.iloc[0]:%Y-%m-%d} on), raw model vs calibrated:\n" +
+    print(f"\nCalibrator learned on matches before {cut:%Y-%m-%d %H:%M} ({len(early)} lines), tested on the "
+          f"{len(late)} lines after, raw model vs calibrated:\n" +
           pd.DataFrame({"raw": summary(raw), "calibrated": summary(calibrated)}).round(3).to_string())
-    print("\nCalibrated, by edge:\n" +
-          calibrated.groupby("edge_bucket", observed=True).apply(summary, include_groups=False).round(3).to_string())
+    if len(calibrated):
+        print("\nCalibrated, by edge:\n" +
+              calibrated.groupby("edge_bucket", observed=True).apply(summary, include_groups=False).round(3).to_string())
     print("\nCalibrated P(over) vs actual over rate:\n" + calibration(decide(late, cal)).round(3).to_string())
-    joblib.dump(fit_calibrator(out), CAL_FILE)
-    print(f"\nsaved {CAL_FILE} (refit on all {len(out)} lines); `predict` now uses it")
+    d = late[late.result != "PUSH"]
+    y, p_raw = d.result == "OVER", (d.p_over / (d.p_over + d.p_under)).clip(1e-6, 1 - 1e-6)
+    p_cal = cal.predict_proba(cal_inputs(d))[:, 1]
+    loss_raw, loss_cal = log_loss(y, p_raw, labels=[False, True]), log_loss(y, p_cal, labels=[False, True])
+    print(f"\nLater matches, log loss (lower is better): raw {loss_raw:.4f}, calibrated {loss_cal:.4f}")
+    if kind != MODEL:
+        return print(f"A {kind} backtest does not save a calibrator: `predict` uses the {MODEL} models.")
+    if loss_cal >= loss_raw:
+        return print(f"The calibrator did not beat the raw model on later matches, so it was not saved. "
+                     f"{CAL_FILE} was left as it was.")
+    joblib.dump({"cal": fit_calibrator(out), "kind": kind, "features": FEATURES, "series": n_series,
+                 "source": str(props_csv), "through": out.start_date.max()}, CAL_FILE)
+    print(f"Saved {CAL_FILE} (refit on all {n_series} player-series); `predict` now uses it.")
 
 
 if __name__ == "__main__":

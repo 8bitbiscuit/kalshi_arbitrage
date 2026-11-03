@@ -62,6 +62,9 @@ def test_elo_probabilities_and_parsing():
     out = model.decide(two, Half())
     assert np.allclose(out.p_over, [0.45, 0.5]) and np.allclose(out.p_under, [0.45, 0.5])  # 10% push kept
     assert (out.pick == "PASS").all()
+    # Pushes are refunded: 53% over / 39% under on a whole-number line is 57.6% when it is decided, so OVER at -119.
+    whole = pd.DataFrame(dict(p_over=[0.53], p_under=[0.39], over_odds=-119, under_odds=-119))
+    assert model.decide(whole).pick.iloc[0] == "OVER"
     assert lines.market("MAPS 1-2 Kills") == lines.market("kills_on_maps_1_2") == {"stat": "kills", "maps": "1-2"}
     assert lines.market("1st_3_maps_player_headshots") == {"stat": "headshots", "maps": "1-3"}
     assert lines.market("2nd_map_player_kills") == {"stat": "kills", "maps": "2"}
@@ -88,7 +91,9 @@ def test_train_then_predict(tmp_path, monkeypatch):
     when = "2026-01-01T00:00:00Z"
     pd.DataFrame([  # the book calls player 'max' "MaxOff" and the team "Team Alpha Esports"
         dict(book="a", player="MaxOff", team="Team Alpha Esports", opponent="Delta", stat="kills", maps="1-2",
-             line=30.5, start_time=when, win_market=0.8),  # the other lines of this match share it
+             line=30.5, start_time=when),
+        dict(book="pickfinder", player="max", team="Alpha", opponent="Delta", stat="match_odds", maps="",
+             start_time=when, win_market=0.8),  # odds-only row: every line of this match shares it
         dict(book="b", player="maxoff", team="Alpha", opponent="Delta", stat="headshots", maps="1-2",
              line=25.5, over_odds=-112, under_odds=-112, start_time=when),
         dict(book="a", player="p7", team="Bravo", opponent="Charlie", stat="kills", maps="1-3", line=45.5, start_time=when),
@@ -129,7 +134,9 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
 
     early, bt = run(pd.Timedelta(minutes=-5)), run(pd.Timedelta(minutes=5))
     printed = capsys.readouterr().out
-    assert "agrees with bo3.gg on 100.0%" in printed and "saved data/calibrator.joblib" in printed
+    assert "agrees with bo3.gg on 100.0%" in printed and "log loss" in printed
+    saved = "Saved data/calibrator.joblib" in printed
+    assert saved or "did not beat the raw model" in printed  # saved only when it wins on later matches
     pd.testing.assert_series_equal(early.proj, bt.proj)  # listing the match late must not leak its result
     assert len(bt) >= 0.95 * len(late)  # a few series fail load()'s sanity checks and are not graded
     assert (bt[bt.player == "max"].pick == "OVER").mean() > 0.9
@@ -139,7 +146,7 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
     pd.DataFrame([dict(book="a", player="max", team="Alpha Gaming", opponent="Delta", stat="kills", maps="1-2",
                        line=30.5, start_time="2026-01-01T00:00:00Z")]).to_csv("data/lines.csv", index=False)
     model.predict()
-    assert "calibrated on real lines" in capsys.readouterr().out
+    assert ("calibrated on" in capsys.readouterr().out) == saved
 
 
 def test_pickfinder_history_rows():
@@ -188,3 +195,30 @@ def test_lines_archive_survives_a_new_column(tmp_path):
     got = pd.read_csv(path)
     assert got.columns.tolist() == ["book", "line", "win_market", "scraped_at"]
     assert got.book.tolist() == ["a", "b", "c"] and got.win_market.isna().tolist() == [True, False, False]
+
+
+def test_calibrator_saved_only_when_it_beats_the_raw_model(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    df = fake_maps(400)
+    df.to_csv("data/maps.csv", index=False)
+    s = model.series(df)
+    late = s[s.match_id >= 250]
+    names = dict(enumerate(TEAMS))
+    pd.DataFrame(dict(book="pf", player=["max" if p == 0 else f"p{p}" for p in late.player_id],
+                      team=late.team_id.map(names), opponent=late.opp_id.map(names), stat="kills", maps="1-2",
+                      line=np.where(late.player_id == 0, 39.5, 29.5), over_odds=-115, under_odds=-115,
+                      start_time=late.start_date.dt.strftime("%Y-%m-%dT%H:%M:%SZ"))).to_csv("data/props.csv", index=False)
+    # A raw model that is sure every line goes over (lines sit at the players' means, so ~half do): the
+    # calibrator learned from real outcomes must beat it, get saved, and be used by predict.
+    monkeypatch.setattr(model, "probs", lambda pred, line, z: (np.full(len(pred), 0.95), np.full(len(pred), 0.05)))
+    model.backtest("data/props.csv")
+    assert "Saved data/calibrator.joblib" in capsys.readouterr().out
+    model.train()
+    pd.DataFrame([dict(book="a", player="max", team="Alpha Gaming", opponent="Delta", stat="kills", maps="1-2",
+                       line=39.5, start_time="2026-01-01T00:00:00Z")]).to_csv("data/lines.csv", index=False)
+    model.predict()
+    printed = capsys.readouterr().out
+    assert "calibrated on" in printed and "data/props.csv" in printed
+    p = pd.read_csv("data/picks.csv").p_over.iloc[0]
+    assert 0.3 < p < 0.7  # the calibrator pulled the raw 0.95 back toward what actually happened

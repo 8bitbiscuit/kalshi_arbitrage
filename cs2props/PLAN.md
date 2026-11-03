@@ -71,9 +71,9 @@ The same things PickFinder shows in the screenshots, built so nothing from the p
 | `adr_l20`, `kast_l20` | Damage per round, KAST | K/D, rating |
 | `map_kpr`, `map_factor` | Likely maps: how often **both teams** picked each map recently (maps 1-2 of their best-of-3s among their last 30 maps), and the player's KPR on each (shrunk toward their overall KPR with a 100-round prior). `map_kpr` is that weighted KPR; `map_factor` is it divided by their overall KPR | Map Picks + per-map Kills/KPR |
 | `win_prob`, `elo_opp` | Per-map win probability for the player's team: the market's, when the line came with one (PickFinder), converted from series to map odds; otherwise from our map-level Elo. A team id seen for the first time (a roster moving org, e.g. LP to BARCA) starts from its players' previous teams' ratings | Moneyline implied win % |
-| `closeness`, `exp_rounds` | How even the match should be (1 = coin flip), and the expected rounds per map that implies, from a round-by-round model of first-to-13 with overtime: about 23 rounds for an even map, 21 when one side is a 90% favourite | Potential Blowout, match score odds |
+| (inside `exp_kills_m12`) | How even the match should be, as expected rounds per map from a round-by-round model of first-to-13 with overtime: about 23 rounds for an even map, 21 when one side is a 90% favourite. As separate inputs, closeness and expected rounds made projections jump by kills on a 0.01 change in win probability (the trees split on noise), with no accuracy gain, so they only enter through the expected-kills feature | Potential Blowout, match score odds |
 | `opp_rounds` | How long the opponent's recent maps ran (the player's own team is in `rounds_l20`) | |
-| `exp_kills_m12`, `exp_hs_m12` | Expected maps 1-2 kills from the pieces above: 2 × expected rounds × KPR on likely maps (× HS% for headshots) | |
+| `exp_kills_m12`, `exp_hs_m12` | Expected maps 1-2 kills: 2 × expected rounds (from closeness) × KPR on likely maps (× HS% for headshots). The model's most important input | |
 | `maps_played` | Experience; lets the model distrust thin histories | sample size |
 
 Why map pool, not actual maps: lines lock before the veto, and bo3.gg has had no veto data since
@@ -81,8 +81,9 @@ mid-September 2026. Using the actual maps in training but not at prediction time
 something it can't use live.
 
 Where the market win probability comes from: PickFinder records both teams' implied win chances with every
-past line (Prop History) and with every current prop. `pickfinder history` stores it with each past line
-and `lines --pickfinder` with each live one. Any line without it (PrizePicks, Underdog and Sleeper's own
+past line (Prop History) and with every current prop. `pickfinder history` stores it with each past line.
+`lines --pickfinder` writes one odds-only row per match (stat `match_odds`), so matches PickFinder lists
+only for PrizePicks, Underdog or Sleeper still get it. Any line without it (PrizePicks, Underdog and Sleeper's own
 feeds) borrows it from another line of the same match, else falls back to our Elo. The training data
 (90,000 bo3.gg series) has no odds, so the model learns from Elo; the market only replaces Elo when lines
 are scored. Both describe the same thing, the chance the player's team wins a map.
@@ -108,9 +109,12 @@ decider). bo3.gg's own pick/ban records stopped in mid-September 2026.
 - **Split by time:** oldest 70% train, next 15% validate (tuning and the error spread), newest 15% test.
 - **Calibrated on real lines:** the model alone was far too confident against real books (see section 6),
   so `backtest` learns a small logistic regression from real graded lines: how often a line went over,
-  given how far the projection was from it (per stat). It is fitted on the earlier 60% of lines, judged on
-  the later 40%, then refit on all and saved to `data/calibrator.joblib`. `predict` then uses it for
-  P(over); the model still supplies the chance of a push on whole-number lines.
+  given how far the projection was from it (per stat). It is fitted on matches before a cut-off (about 60%
+  of lines) and judged on the matches after it. It is saved to `data/calibrator.joblib` only if it beats
+  the raw model's log loss on those later matches, and only from at least 300 player-series in 30 matches
+  (copies of a line at several books count once). `predict` uses it only if it was learned with the same
+  model and features, and says how many series it came from. The model still supplies the push chance.
+- **Picks ignore pushes:** a push is refunded, so a pick compares P(over | no push) with the breakeven.
 - **What `train` prints:** test MAE of the model versus the naive "2 × 20-map average", a stand-in-line
   hit rate (optimistic, since real books are sharper than a 20-map average), Brier score versus a coin
   flip, and the top features (how much the test error rises when each feature is shuffled).
@@ -225,10 +229,11 @@ are two sources:
   - "always over / always under" baselines
   - a calibration table (predicted P(over) vs actual)
   - the share of lines that had a market win probability
-- **Calibrator:** with 300+ graded lines it then fits the calibrator on the earlier 60%, prints raw vs
-  calibrated results on the later 40% (overall, by edge, and calibration), and saves it for `predict`.
-  Check that the calibrated table's actual over rates track the predicted ones, and that bigger edges no
-  longer do worse.
+- **Calibrator:** with 300+ player-series from 30+ matches it then fits the calibrator on earlier matches,
+  prints raw vs calibrated results on later ones (overall, by edge, calibration table, log loss), and
+  saves it for `predict` only if its log loss is lower. Otherwise the existing file is left alone. A
+  `tree` backtest never saves one. On a one-day archive of 307 lines (154 series) the first version saved a
+  calibrator that cut the later hit rate from 51.6% to 39.6%; these rules stop that.
 - **Per-line results** go to `data/backtest.csv`.
 
 Only trust the picks if the hit rate beats breakeven by more than the band. At 500 bets the band is
