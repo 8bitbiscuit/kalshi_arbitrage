@@ -17,7 +17,8 @@ python -m cs2props.history
 ```
 
 2. Fetch current lines from PrizePicks, Underdog and Sleeper. Add `--pickfinder` to include every book
-   PickFinder tracks.
+   PickFinder tracks and the market's win probability for each match, which the model uses in place of
+   its own team ratings.
 
 ```bash
 python -m cs2props.lines
@@ -31,7 +32,8 @@ python -m cs2props.model predict
 
 ## Model
 
-Retrain about weekly:
+Retrain about weekly, and always after updating the package (`predict` refuses models saved with an
+older feature list):
 
 ```bash
 python -m cs2props.model train
@@ -52,7 +54,8 @@ python -m cs2props.pickfinder history
 ```
 
 Grade the model on those lines. Add `data/lines_history.csv` to use your own archive instead, and `tree`
-after the file to test the single tree.
+after the file to test the single tree. With 300+ graded lines it also learns a calibrator from them
+(`data/calibrator.joblib`), which `predict` then uses.
 
 ```bash
 python -m cs2props.model backtest
@@ -102,3 +105,4 @@ At the top of `cs2props/model.py`:
 | `picks.csv` | `predict` | Projections, probabilities, edges and picks |
 | `prop_history.csv` | `pickfinder history` | PickFinder past lines with results |
 | `backtest.csv` | `backtest` | Per-line backtest results |
+| `calibrator.joblib` | `backtest` | P(over) learned from real graded lines, used by `predict` |

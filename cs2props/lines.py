@@ -15,7 +15,9 @@ import pandas as pd
 import requests
 
 LINES_CSV, HISTORY_CSV = "data/lines.csv", "data/lines_history.csv"
-COLS = ["book", "player", "team", "opponent", "stat", "maps", "line", "over_odds", "under_odds", "start_time"]
+# win_market: the market's chance that the player's team wins the series (only PickFinder supplies it).
+COLS = ["book", "player", "team", "opponent", "stat", "maps", "line", "over_odds", "under_odds", "start_time",
+        "win_market"]
 http = requests.Session()
 http.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
                                    "Chrome/130.0 Safari/537.36", "Accept": "application/json"})
@@ -36,6 +38,11 @@ def market(text):
     digits = [int(d) for d in re.findall(r"\d", s)]
     maps = f"1-{max(digits)}" if len(digits) > 1 or "maps" in s else str(digits[0]) if digits else ""
     return dict(stat=stat, maps=maps)
+
+
+def win_share(team, opp):
+    """The team's share of the two implied win probabilities (removes the bookmaker's margin)."""
+    return team / (team + opp) if team and opp else None
 
 
 def american(decimal_payout):
@@ -106,7 +113,17 @@ def pickfinder():
                     continue
                 yield dict(book=book, player=it["player_name"], team=(it.get("team") or {}).get("name"),
                            opponent=(it.get("opponent") or {}).get("name"), line=it["line"], over_odds=prices[0],
-                           under_odds=prices[1], start_time=it.get("start_date"), **market(it["market_id"]))
+                           under_odds=prices[1], start_time=it.get("start_date"), **market(it["market_id"]),
+                           win_market=win_share(it.get("team_ml_percent"), it.get("opponent_ml_percent")))
+
+
+def append_csv(new, path):
+    """Append rows; if the file was written with other columns (an older version), rewrite it once."""
+    if not os.path.exists(path):
+        return new.to_csv(path, index=False)
+    if pd.read_csv(path, nrows=0).columns.tolist() == new.columns.tolist():
+        return new.to_csv(path, mode="a", header=False, index=False)
+    pd.concat([pd.read_csv(path), new])[new.columns].to_csv(path, index=False)
 
 
 def main():
@@ -123,8 +140,7 @@ def main():
     df["start_time"] = pd.to_datetime(df.start_time, utc=True, format="ISO8601")
     os.makedirs("data", exist_ok=True)
     df.to_csv(LINES_CSV, index=False)
-    df.assign(scraped_at=pd.Timestamp.now(tz="UTC")).to_csv(
-        HISTORY_CSV, mode="a", header=not os.path.exists(HISTORY_CSV), index=False)
+    append_csv(df.assign(scraped_at=pd.Timestamp.now(tz="UTC")), HISTORY_CSV)
     print(f"wrote {len(df)} lines to {LINES_CSV}")
 
 

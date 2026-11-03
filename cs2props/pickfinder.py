@@ -23,7 +23,7 @@ from urllib.parse import quote, urlencode
 
 import pandas as pd
 
-from cs2props.lines import COLS, http
+from cs2props.lines import COLS, http, win_share
 
 API, SITE = "https://api-v2.pickfinder.app", "https://www.pickfinder.app"
 MARKETS = {"Maps 1-2 Kills": "kills", "Maps 1-2 HS": "headshots"}  # PickFinder's display names
@@ -138,7 +138,9 @@ def player_rows(it, games, history, since):
                     rows.append(dict(book=book, player=it["player_name"], team=r["team"], opponent=r["vs"],
                                      stat=MARKETS[display], maps="1-2", line=book_line(app, h["line"]),
                                      over_odds=prices[0], under_odds=prices[1], start_time=r["start"].isoformat(),
-                                     actual=r[MARKETS[display]]))
+                                     actual=r[MARKETS[display]],
+                                     win_market=win_share((h.get("teamOdds") or {}).get("implied"),
+                                                          (h.get("opponentOdds") or {}).get("implied"))))
     return rows
 
 

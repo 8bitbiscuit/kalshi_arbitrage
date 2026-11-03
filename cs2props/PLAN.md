@@ -28,6 +28,10 @@ python -m pytest cs2props -q        # self-checks (leakage, probabilities, name 
 
 Daily: `history` then `lines` then `predict`. Retrain weekly or after big roster moves.
 
+After updating the package: run `train` again (saved models remember their feature list and `predict`
+refuses old ones), and re-run `pickfinder history` so past lines get their market win probabilities.
+Then `backtest` learns the calibrator that `predict` uses.
+
 ## 1. Training data: bo3.gg, not HLTV
 
 | Source | Has per-map kills + HS? | Access | Verdict |
@@ -65,17 +69,26 @@ The same things PickFinder shows in the screenshots, built so nothing from the p
 | `kpr`, `rounds_l20` | Kills per round; average rounds per map (close games mean more rounds, more kills) | KPR in Map Stats |
 | `hs_pct` | Headshots / kills over the last 20 maps | HS % |
 | `adr_l20`, `kast_l20` | Damage per round, KAST | K/D, rating |
-| `map_factor` | Player's KPR on each map (shrunk toward overall KPR with a 100-round prior), weighted by how often **both teams** played each map in their last 15 maps, divided by overall KPR | Map Picks + per-map Kills/KPR |
-| `win_prob`, `elo_opp` | Map-level Elo built from every bo3.gg result; win probability for the player's team and opponent strength. A team id seen for the first time (a roster moving org, e.g. LP to BARCA) starts from its players' previous teams' ratings | Moneyline implied win % |
+| `map_kpr`, `map_factor` | Likely maps: how often **both teams** picked each map recently (maps 1-2 of their best-of-3s among their last 30 maps), and the player's KPR on each (shrunk toward their overall KPR with a 100-round prior). `map_kpr` is that weighted KPR; `map_factor` is it divided by their overall KPR | Map Picks + per-map Kills/KPR |
+| `win_prob`, `elo_opp` | Per-map win probability for the player's team: the market's, when the line came with one (PickFinder), converted from series to map odds; otherwise from our map-level Elo. A team id seen for the first time (a roster moving org, e.g. LP to BARCA) starts from its players' previous teams' ratings | Moneyline implied win % |
+| `closeness`, `exp_rounds` | How even the match should be (1 = coin flip), and the expected rounds per map that implies, from a round-by-round model of first-to-13 with overtime: about 23 rounds for an even map, 21 when one side is a 90% favourite | Potential Blowout, match score odds |
+| `opp_rounds` | How long the opponent's recent maps ran (the player's own team is in `rounds_l20`) | |
+| `exp_kills_m12`, `exp_hs_m12` | Expected maps 1-2 kills from the pieces above: 2 × expected rounds × KPR on likely maps (× HS% for headshots) | |
 | `maps_played` | Experience; lets the model distrust thin histories | sample size |
 
 Why map pool, not actual maps: lines lock before the veto, and bo3.gg has had no veto data since
 mid-September 2026. Using the actual maps in training but not at prediction time would teach the model
 something it can't use live.
 
-Why our own Elo instead of the sportsbook moneyline: there is no history of pre-match odds (bo3.gg only
-keeps the last, post-result price), so a book price can't be a training feature. Elo is computed the same
-way in training and live.
+Where the market win probability comes from: PickFinder records both teams' implied win chances with every
+past line (Prop History) and with every current prop. `pickfinder history` stores it with each past line
+and `lines --pickfinder` with each live one. Any line without it (PrizePicks, Underdog and Sleeper's own
+feeds) borrows it from another line of the same match, else falls back to our Elo. The training data
+(90,000 bo3.gg series) has no odds, so the model learns from Elo; the market only replaces Elo when lines
+are scored. Both describe the same thing, the chance the player's team wins a map.
+
+Likely maps come from maps 1-2 of best-of-3s because those are always one team's pick (map 3 is the
+decider). bo3.gg's own pick/ban records stopped in mid-September 2026.
 
 ## 3. Model
 
@@ -93,6 +106,11 @@ way in training and live.
 - **Tuning:** loss (squared error or Poisson, which suits counts), learning rate 0.05 or 0.1, and 15 or
   31 leaves per tree, chosen on a validation slice by MAE. Both stats chose Poisson, 0.05 and 15.
 - **Split by time:** oldest 70% train, next 15% validate (tuning and the error spread), newest 15% test.
+- **Calibrated on real lines:** the model alone was far too confident against real books (see section 6),
+  so `backtest` learns a small logistic regression from real graded lines: how often a line went over,
+  given how far the projection was from it (per stat). It is fitted on the earlier 60% of lines, judged on
+  the later 40%, then refit on all and saved to `data/calibrator.joblib`. `predict` then uses it for
+  P(over); the model still supplies the chance of a push on whole-number lines.
 - **What `train` prints:** test MAE of the model versus the naive "2 × 20-map average", a stand-in-line
   hit rate (optimistic, since real books are sharper than a 20-map average), Brier score versus a coin
   flip, and the top features (how much the test error rises when each feature is shuffled).
@@ -111,6 +129,12 @@ Trained on bo3.gg data from July 2025 to October 2026, about 90,000 player-serie
 | Brier on the stand-in line, boosting / tree (0.250 = coin flip) | 0.235 / 0.237 | 0.238 / 0.241 |
 | Distinct projections on the 13,618 test rows, boosting / tree | 6,768 / 54 | 7,184 / 56 |
 | Most important features | kills per round, map factor, win probability, opponent Elo | 20-map headshots, HS% |
+
+Adding the likely-maps, closeness and expected-rounds features left these errors unchanged on bo3.gg
+data (6.057 → 6.051 kills, 3.838 → 3.834 headshots; both gains are inside their paired 95% bands of 0.012
+and 0.006). The new expected-kills feature became the model's top input, but it repackages what the model
+could already combine from KPR, Elo and map form. Its value should show on real lines, where the market's
+win probability is sharper than Elo, which only the backtest on your PickFinder lines can measure.
 
 Boosting beats the single tree on both stats by a small margin that the paired test says is real. It
 also gives every player their own projection: the tree put everyone into about 55 groups that shared one
@@ -200,6 +224,11 @@ are two sources:
   - all of that split by edge bucket, stat, OVER/UNDER and book
   - "always over / always under" baselines
   - a calibration table (predicted P(over) vs actual)
+  - the share of lines that had a market win probability
+- **Calibrator:** with 300+ graded lines it then fits the calibrator on the earlier 60%, prints raw vs
+  calibrated results on the later 40% (overall, by edge, and calibration), and saves it for `predict`.
+  Check that the calibrated table's actual over rates track the predicted ones, and that bigger edges no
+  longer do worse.
 - **Per-line results** go to `data/backtest.csv`.
 
 Only trust the picks if the hit rate beats breakeven by more than the band. At 500 bets the band is
@@ -240,10 +269,11 @@ request, but check PickFinder's terms before running it often.
 
 Next steps, in order of value:
 
-- **A classifier trained on real lines.** Once a few thousand graded lines exist, train it on
-  `(features, line) → over?`.
-- **Monthly walk-forward refits in the backtest.** It trains once, before the first graded line, so later
-  lines use a model that is months old. The calibration drift above is the symptom.
+- **More inputs to the calibrator** once more lines exist: the market's closeness, the book, how far
+  the line moved.
+- **Monthly walk-forward refits in the backtest.** It trains once, before the first graded line. A check
+  on bo3.gg data found this costs little: a model trained before August projected only about 0.2 kills
+  too low by October, and monthly refits barely changed that.
 
 ## 7. Known limitations
 

@@ -49,6 +49,19 @@ def test_elo_probabilities_and_parsing():
     over, under = model.probs([30.0, 30.0, 30.0], [30.5, 30.5, 30.0], np.array([-1.0, 0.0, 1.0]))
     assert np.allclose(over, [1 / 3] * 3) and np.allclose(under, [2 / 3, 2 / 3, 1 / 3])  # 30.0 line: push 1/3
     assert round(model.american_to_prob(-115), 4) == 0.5349
+    rounds = model.map_rounds(np.array([0.5, 0.7, 0.9]))
+    assert rounds[0] > rounds[1] > rounds[2] > 20  # close maps run longer
+    assert np.allclose(model.series_to_map(pd.Series([0.5, 0.6 ** 2 * 1.8, np.nan])), [0.5, 0.6, np.nan], equal_nan=True)
+
+    class Half:  # a calibrator that says every line is a coin flip
+        def predict_proba(self, X):
+            return np.full((len(X), 2), 0.5)
+
+    two = pd.DataFrame(dict(proj=[30.0, 30.0], line=[30.0, 31.5], stat="kills", p_over=[0.4, 0.4],
+                            p_under=[0.5, 0.6], over_odds=-110, under_odds=-110))
+    out = model.decide(two, Half())
+    assert np.allclose(out.p_over, [0.45, 0.5]) and np.allclose(out.p_under, [0.45, 0.5])  # 10% push kept
+    assert (out.pick == "PASS").all()
     assert lines.market("MAPS 1-2 Kills") == lines.market("kills_on_maps_1_2") == {"stat": "kills", "maps": "1-2"}
     assert lines.market("1st_3_maps_player_headshots") == {"stat": "headshots", "maps": "1-3"}
     assert lines.market("2nd_map_player_kills") == {"stat": "kills", "maps": "2"}
@@ -75,7 +88,7 @@ def test_train_then_predict(tmp_path, monkeypatch):
     when = "2026-01-01T00:00:00Z"
     pd.DataFrame([  # the book calls player 'max' "MaxOff" and the team "Team Alpha Esports"
         dict(book="a", player="MaxOff", team="Team Alpha Esports", opponent="Delta", stat="kills", maps="1-2",
-             line=30.5, start_time=when),
+             line=30.5, start_time=when, win_market=0.8),  # the other lines of this match share it
         dict(book="b", player="maxoff", team="Alpha", opponent="Delta", stat="headshots", maps="1-2",
              line=25.5, over_odds=-112, under_odds=-112, start_time=when),
         dict(book="a", player="p7", team="Bravo", opponent="Charlie", stat="kills", maps="1-3", line=45.5, start_time=when),
@@ -90,6 +103,9 @@ def test_train_then_predict(tmp_path, monkeypatch):
     assert picks.loc[("maxoff", "headshots"), "pick"] == "UNDER"    # ~20 expected vs 25.5
     assert picks.loc[("nobody", "kills"), "pick"] == "NO DATA"
     assert picks.loc[("p1", "kills"), "matched"] == "p1 (Alpha Gaming)"
+    p_map = model.series_to_map(pd.Series([0.8]))[0]
+    assert np.isclose(picks.loc[("MaxOff", "kills"), "win_prob"], p_map)
+    assert np.isclose(picks.loc[("maxoff", "headshots"), "win_prob"], p_map)  # same match, no odds of its own
     assert ("p7", "kills") not in picks.index                        # maps 1-3 is not modelled
 
 
@@ -99,25 +115,31 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
     df = fake_maps(400)
     df.to_csv("data/maps.csv", index=False)
     s = model.series(df)
-    late = s[(s.match_id >= 300) & s.player_id.isin([0, 7])]  # 'max' averages ~40, 'p7' ~30
+    late = s[s.match_id >= 250]  # 'max' (player 0) averages ~40 kills over maps 1-2, everyone else ~30
     names = dict(enumerate(TEAMS))
 
     def run(shift):  # the book lists the match `shift` away from bo3.gg's start time
-        pd.DataFrame(dict(book="pf", player=late.player_id.map({0: "max", 7: "p7"}), team=late.team_id.map(names),
-                          opponent=late.opp_id.map(names), stat="kills", maps="1-2",
-                          line=late.player_id.map({0: 30.5, 7: 36.5}), over_odds=-115, under_odds=-115,
+        pd.DataFrame(dict(book="pf", player=["max" if p == 0 else f"p{p}" for p in late.player_id],
+                          team=late.team_id.map(names), opponent=late.opp_id.map(names), stat="kills", maps="1-2",
+                          line=np.where(late.player_id == 0, 30.5, 36.5), over_odds=-115, under_odds=-115,
                           start_time=(late.start_date + shift).dt.strftime("%Y-%m-%dT%H:%M:%SZ"), actual=late.kills_m12)
                      ).to_csv("data/prop_history.csv", index=False)
         model.backtest()
         return pd.read_csv("data/backtest.csv").sort_values(["player", "match_start"]).reset_index(drop=True)
 
     early, bt = run(pd.Timedelta(minutes=-5)), run(pd.Timedelta(minutes=5))
-    assert "agrees with bo3.gg on 100.0%" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "agrees with bo3.gg on 100.0%" in printed and "saved data/calibrator.joblib" in printed
     pd.testing.assert_series_equal(early.proj, bt.proj)  # listing the match late must not leak its result
     assert len(bt) >= 0.95 * len(late)  # a few series fail load()'s sanity checks and are not graded
     assert (bt[bt.player == "max"].pick == "OVER").mean() > 0.9
-    assert (bt[bt.player == "p7"].pick == "UNDER").mean() > 0.9
+    assert (bt[bt.player != "max"].pick == "UNDER").mean() > 0.9
     assert bt.units.sum() > 0
+    model.train()
+    pd.DataFrame([dict(book="a", player="max", team="Alpha Gaming", opponent="Delta", stat="kills", maps="1-2",
+                       line=30.5, start_time="2026-01-01T00:00:00Z")]).to_csv("data/lines.csv", index=False)
+    model.predict()
+    assert "calibrated on real lines" in capsys.readouterr().out
 
 
 def test_pickfinder_history_rows():
@@ -140,10 +162,11 @@ def test_pickfinder_history_rows():
              game("2025-09-07 11:07:00.000Z", "Copenhagen Wolves", "500", [15, 15]),   # ... team that day
              game("2025-09-01 12:00:00.000Z", "Sat out", "77", [20, 20], score=(2, 1))]  # missed a map
     hist = {"Maps 1-2 Kills": [
-        entry("2025-10-26-138988", 26.5,  # PrizePicks' own line (28.5) is in its link; Underdog's is the entry's
+        dict(entry("2025-10-26-138988", 26.5,  # PrizePicks' own line (28.5) is in its link; Underdog's the entry's
               prizepicks=dict(outcomes=dict(over=side(-119, pp.format("o")), under=side(-119, pp.format("u")))),
               underdog=dict(outcomes=dict(over=side(-115), under=side(-115))),
               goblin=dict(outcomes=dict(over=side(-155, modifier="goblin")))),
+             teamOdds=dict(implied=0.73, american=-385), opponentOdds=dict(implied=0.27)),
         entry("2025-11-01-133719", 26.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-110)))),
         entry("2025-11-09-133719", 25.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-115)))),  # not played
         entry("2025-09-07-500", 27.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-115)))),  # ambiguous
@@ -154,3 +177,14 @@ def test_pickfinder_history_rows():
         ("prizepicks", "DENDELE CS", 28.5, 30, -119), ("underdog", "DENDELE CS", 26.5, 30, -115),
         ("underdog", "PARIVISION", 26.5, 20, -110)]
     assert rows[0]["start_time"].startswith("2025-10-26T16:34") and rows[0]["team"] == "G2"
+    assert rows[0]["win_market"] == 0.73 and rows[2]["win_market"] is None
+
+
+def test_lines_archive_survives_a_new_column(tmp_path):
+    path = tmp_path / "lines_history.csv"
+    pd.DataFrame(dict(book=["a"], line=[30.5], scraped_at=["t0"])).to_csv(path, index=False)  # older version
+    lines.append_csv(pd.DataFrame(dict(book=["b"], line=[25.5], win_market=[0.6], scraped_at=["t1"])), path)
+    lines.append_csv(pd.DataFrame(dict(book=["c"], line=[27.5], win_market=[0.4], scraped_at=["t2"])), path)
+    got = pd.read_csv(path)
+    assert got.columns.tolist() == ["book", "line", "win_market", "scraped_at"]
+    assert got.book.tolist() == ["a", "b", "c"] and got.win_market.isna().tolist() == [True, False, False]
