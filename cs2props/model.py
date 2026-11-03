@@ -411,25 +411,29 @@ def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
         sys.exit("The saved models use an older feature set. Run `python -m cs2props.model train` first.")
     kind = bundles["kills"]["metrics"]["model"]
     miss = json.load(open(MISS_FILE)) if os.path.exists(MISS_FILE) else None
-    if miss is not None and (miss["features"] != FEATURES or miss["kind"] != kind):
-        print(f"Ignoring {MISS_FILE}: it was measured with another model or feature set. Re-run `backtest`.")
+    if miss is not None and (miss["features"] != FEATURES or miss["kind"] != kind
+                             or miss.get("miss_days") != MISS_DAYS):
+        print(f"Ignoring {MISS_FILE}: it was measured with another model, feature set or MISS_DAYS. Re-run `backtest`.")
         miss = None
+    kills_miss = miss["kills_miss"] if miss else 0.0
     cal = joblib.load(CAL_FILE) if os.path.exists(CAL_FILE) else None
-    # The calibrator must have been learned on projections corrected the same way (miss_days marks those).
+    # The calibrator must come from the same backtest as the kills correction applied here.
     if cal is not None and not (isinstance(cal, dict) and cal["features"] == FEATURES and cal["kind"] == kind
-                                and cal.get("miss_days") == MISS_DAYS):
+                                and abs(cal.get("kills_miss", np.nan) - kills_miss) < 1e-9):
         print(f"Ignoring {CAL_FILE}: it was learned with another model, feature set or kills correction. "
               "Re-run `backtest`.")
         cal = None
-    out = score(pd.read_csv(lines_csv), df, bundles, cal and cal["cal"], miss["kills_miss"] if miss else 0.0)
+    out = score(pd.read_csv(lines_csv), df, bundles, cal and cal["cal"], kills_miss)
     out = out.sort_values("edge", ascending=False)
     cols = ["book", "player", "matched", "team", "opponent", "stat", "line", "proj", "p_over", "p_under", "edge", "pick"]
     out.to_csv(PICKS_CSV, index=False)
     print(out[[c for c in cols if c in out]].round(3).to_string(index=False))
     print(f"\n{(out.pick == 'NO DATA').sum()} of {len(out)} lines had no usable history (check 'matched').")
-    print(f"Kills projections are corrected by {miss['kills_miss']:+.2f}, the average miss on {miss['series']} real "
-          f"kills player-series in the {MISS_DAYS} days to {miss['through']}." if miss is not None else
-          "Kills projections are uncorrected: run `backtest` on real lines to measure their average miss.")
+    print(f"Kills projections are corrected by {kills_miss:+.2f}, the average miss on {miss['series']} real kills "
+          f"player-series in the {miss['miss_days']} days to {miss['through']}." if kills_miss else
+          "Kills projections are uncorrected: run `backtest` on real lines to measure their average miss." if miss is None
+          else f"Kills projections are uncorrected: only {miss['series']} real kills player-series in the last "
+               f"{miss['miss_days']} days ({MISS_MIN} are needed).")
     print(f"P(over) is calibrated on {cal['series']} real player-series ({cal['source']}, through {cal['through']:%Y-%m-%d})."
           if cal is not None else "P(over) is the model's raw estimate: run `backtest` on real lines to learn a calibrator.")
 
@@ -525,7 +529,7 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     recent = k_raw[k_raw.match_start >= k_raw.match_start.max() - pd.Timedelta(days=MISS_DAYS)]
     live_miss = (recent.actual - recent.proj).mean()  # for `predict`, from the latest MISS_DAYS
     before = grade(out)
-    out["kills_miss"] = recent_miss(out)
+    out["kills_miss"] = np.where(out.stat == "kills", recent_miss(out), 0.0)
     out = decide(correct_kills(out, out.kills_miss.to_numpy(), bundles))
     bet = grade(out)
     out.merge(bet[["units"]], left_index=True, right_index=True, how="left").to_csv(BACKTEST_CSV, index=False)
@@ -548,17 +552,19 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
                         "after": pd.concat([summary(ka), pd.Series({"over share": (ka.pick == "OVER").mean()})])}
                        ).round(3).to_string())
     print(f"\nper-line results saved to {BACKTEST_CSV}")
-    if kind == MODEL and len(recent) >= MISS_MIN:
+    if kind == MODEL:
+        # Always rewritten (0 when too few series), and the calibrator below records the same number, so `predict`
+        # never pairs a calibrator with a correction from another run.
         # ponytail: measured against the backtest's models (trained before the first line); `train` fits fresher
         # ones on all data, so this may over-correct slightly. A refit per month here would remove that.
+        saved_miss = float(live_miss) if len(recent) >= MISS_MIN else 0.0
         with open(MISS_FILE, "w") as f:
-            json.dump({"kills_miss": float(live_miss), "series": len(recent), "kind": kind, "features": FEATURES,
-                       "through": f"{out.start_date.max():%Y-%m-%d}"}, f)
-        print(f"Saved {MISS_FILE}: `predict` adds {live_miss:+.2f} to kills projections "
-              f"(average miss on {len(recent)} kills player-series in the last {MISS_DAYS} days).")
-    elif kind == MODEL:
-        print(f"Only {len(recent)} kills player-series in the last {MISS_DAYS} days: {MISS_MIN} are needed to save "
-              f"a kills correction. {MISS_FILE} was left as it was.")
+            json.dump({"kills_miss": saved_miss, "series": len(recent), "miss_days": MISS_DAYS, "kind": kind,
+                       "features": FEATURES, "through": f"{recent.match_start.max():%Y-%m-%d}" if len(recent) else None},
+                      f)
+        print(f"Saved {MISS_FILE}: `predict` adds {saved_miss:+.2f} to kills projections ("
+              + (f"average miss on {len(recent)} kills player-series in the last {MISS_DAYS} days)." if saved_miss else
+                 f"only {len(recent)} kills player-series in the last {MISS_DAYS} days; {MISS_MIN} are needed)."))
 
     # Learn P(over) from the real lines themselves: fit on earlier matches, judge on later ones. Copies of a
     # line at several books share one outcome, so the minimums count player-series and matches, not rows.
@@ -590,7 +596,7 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
         return print(f"The calibrator did not beat the raw model on later matches, so it was not saved. "
                      f"{CAL_FILE} was left as it was.")
     joblib.dump({"cal": fit_calibrator(out), "kind": kind, "features": FEATURES, "series": n_series,
-                 "source": str(props_csv), "through": out.start_date.max(), "miss_days": MISS_DAYS}, CAL_FILE)
+                 "source": str(props_csv), "through": out.start_date.max(), "kills_miss": saved_miss}, CAL_FILE)
     print(f"Saved {CAL_FILE} (refit on all {n_series} player-series); `predict` now uses it.")
 
 

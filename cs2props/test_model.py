@@ -1,4 +1,6 @@
 """python -m pytest cs2props -q"""
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -224,6 +226,11 @@ def test_calibrator_saved_only_when_it_beats_the_raw_model(tmp_path, monkeypatch
     assert "calibrated on" in printed and "data/props.csv" in printed
     p = pd.read_csv("data/picks.csv").p_over.iloc[0]
     assert 0.3 < p < 0.7  # the calibrator pulled the raw 0.95 back toward what actually happened
+    # A kills correction from another run must not be paired with this calibrator.
+    miss = json.load(open("data/kills_miss.json"))
+    json.dump({**miss, "kills_miss": miss["kills_miss"] + 1}, open("data/kills_miss.json", "w"))
+    model.predict()
+    assert "Ignoring data/calibrator.joblib" in capsys.readouterr().out
 
 
 def test_recency_weights_and_walk_forward_kills_miss():

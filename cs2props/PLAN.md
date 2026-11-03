@@ -115,8 +115,9 @@ decider). bo3.gg's own pick/ban records stopped in mid-September 2026.
   gets the average (actual − projection) of real kills lines from the last 30 days added (`MISS_DAYS`),
   once at least 50 player-series exist (`MISS_MIN`). The backtest measures this walk-forward: each line
   only uses results from matches at least a day before it. It then saves the latest 30 days' figure to
-  `data/kills_miss.json` for `predict`. Headshots are not corrected, because the recency weights already
-  remove their bias.
+  `data/kills_miss.json` for `predict`. Every backtest rewrites that file (0 when there are too few series)
+  and the calibrator records the same figure, so `predict` never pairs a calibrator with a correction from
+  another run. Headshots are not corrected, because the recency weights already remove their bias.
 - **Calibrated on real lines:** the model alone was far too confident against real books (see section 6),
   so `backtest` learns a small logistic regression from real graded lines: how often a line went over,
   given how far the projection was from it (per stat). It is fitted on matches before a cut-off (about 60%
