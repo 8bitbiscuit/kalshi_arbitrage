@@ -11,6 +11,7 @@ spread of its held-out errors.
 Any line, from any book, can then be scored without retraining.
 """
 import difflib
+import json
 import os
 import re
 import sys
@@ -27,6 +28,7 @@ from sklearn.tree import DecisionTreeRegressor
 
 MAPS_CSV, LINES_CSV, PICKS_CSV = "data/maps.csv", "data/lines.csv", "data/picks.csv"
 PROPS_CSV, BACKTEST_CSV, CAL_FILE = "data/prop_history.csv", "data/backtest.csv", "data/calibrator.joblib"
+MISS_FILE = "data/kills_miss.json"
 STATS = ("kills", "headshots")
 FEATURES = ["kills_l20", "kills_l5", "headshots_l20", "hs_pct", "kpr", "adr_l20", "kast_l20", "rounds_l20",
             "maps_played", "map_factor", "map_kpr", "win_prob", "elo_opp", "opp_rounds", "exp_kills_m12", "exp_hs_m12"]
@@ -186,6 +188,11 @@ def series(df):
 
 
 MODEL = "gbm"  # "gbm": gradient-boosted trees (default); "tree": one decision tree
+HALF_LIFE_DAYS = 90  # training weight halves every 90 days before the newest match (None: all matches equal)
+# Kills projections run low against real lines (props go to standout players, whom the trees pull toward the
+# average). They are corrected by the average miss (actual - projection) of real kills lines over the last
+# MISS_DAYS days, once at least MISS_MIN player-series are available.
+MISS_DAYS, MISS_MIN = 30, 50
 GRIDS = {  # settings tried on the validation slice; the lowest MAE wins
     "tree": [dict(max_depth=d, min_samples_leaf=n) for d in (3, 4, 5, 6, 8, 10) for n in (25, 50, 100, 200, 400)],
     "gbm": [dict(loss=loss, learning_rate=lr, max_leaf_nodes=n) for loss in ("squared_error", "poisson")
@@ -193,11 +200,19 @@ GRIDS = {  # settings tried on the validation slice; the lowest MAE wins
 }
 
 
-def fit(X, y, kind, params):
+def recency(d):
+    """Training weights: 1 for the newest match, halving every HALF_LIFE_DAYS before it."""
+    if HALF_LIFE_DAYS is None:
+        return None
+    return (0.5 ** ((d.start_date.max() - d.start_date).dt.days / HALF_LIFE_DAYS)).to_numpy()
+
+
+def fit(X, y, kind, params, weights=None):
     if kind == "tree":
-        return DecisionTreeRegressor(random_state=0, **params).fit(X, y)
+        return DecisionTreeRegressor(random_state=0, **params).fit(X, y, sample_weight=weights)
     # Early stopping holds out 10% of the rows it is given and stops adding trees once they stop helping.
-    return HistGradientBoostingRegressor(max_iter=1000, early_stopping=True, random_state=0, **params).fit(X, y)
+    return HistGradientBoostingRegressor(max_iter=1000, early_stopping=True, random_state=0, **params).fit(
+        X, y, sample_weight=weights)
 
 
 def fit_models(feats, kind=MODEL, verbose=True):
@@ -212,8 +227,8 @@ def fit_models(feats, kind=MODEL, verbose=True):
         def mae(m, d):
             return np.abs(m.predict(d[FEATURES]) - d[y]).mean()
 
-        params = min(GRIDS[kind], key=lambda p: mae(fit(tr[FEATURES], tr[y], kind, p), va))
-        model = fit(tr[FEATURES], tr[y], kind, params)
+        params = min(GRIDS[kind], key=lambda p: mae(fit(tr[FEATURES], tr[y], kind, p, recency(tr)), va))
+        model = fit(tr[FEATURES], tr[y], kind, params, recency(tr))
         p = np.maximum(model.predict(va[FEATURES]), 1e-9)
         z = ((va[y] - p) / np.sqrt(p)).to_numpy()
         z = z - z.mean()  # keep the spread, drop any level shift between the train and validation periods
@@ -242,7 +257,8 @@ def fit_models(feats, kind=MODEL, verbose=True):
 
         # ponytail: z comes from the 70%-data model, so production intervals are slightly wide.
         both = pd.concat([tr, va])
-        bundles[stat] = {"model": fit(both[FEATURES], both[y], kind, params), "z": np.sort(z), "metrics": metrics,
+        bundles[stat] = {"model": fit(both[FEATURES], both[y], kind, params, recency(both)), "z": np.sort(z),
+                         "metrics": metrics,
                          "features": FEATURES}
     return bundles
 
@@ -339,7 +355,30 @@ def decide(out, cal=None):
     return out
 
 
-def score(lines, df, bundles, cal=None):
+def recent_miss(out):
+    """For each graded line, the average (actual - projection) of real kills player-series from matches
+    1 to MISS_DAYS + 1 days before its match, so only results final before the line count. 0 when fewer than
+    MISS_MIN such series. Uses the uncorrected projections."""
+    k = out[out.stat == "kills"].drop_duplicates(["player_id", "match_start"]).sort_values("match_start")
+    t = k.match_start.dt.tz_convert(None).to_numpy()
+    total = np.concatenate([[0.0], np.cumsum((k.actual - k.proj).to_numpy(float))])
+    q = out.match_start.dt.tz_convert(None).to_numpy()
+    hi = np.searchsorted(t, q - np.timedelta64(1, "D"))
+    lo = np.searchsorted(t, q - np.timedelta64(MISS_DAYS + 1, "D"))
+    n = hi - lo
+    return np.where(n >= MISS_MIN, (total[hi] - total[lo]) / np.maximum(n, 1), 0.0)
+
+
+def correct_kills(out, miss, bundles):
+    """Add the average miss to kills projections (a number, or one per row) and redo their over/under chances."""
+    out = out.copy()
+    k = ((out.stat == "kills") & out.proj.notna()).to_numpy()
+    out.loc[k, "proj"] = out.proj[k] + (np.asarray(miss)[k] if np.ndim(miss) else miss)
+    out.loc[k, "p_over"], out.loc[k, "p_under"] = probs(out.proj[k], out.line[k], bundles["kills"]["z"])
+    return out
+
+
+def score(lines, df, bundles, cal=None, kills_miss=0.0):
     """Projection, P(over/under), edge and pick for maps 1-2 kill/headshot lines (start_time = as-of time)."""
     lines = lines.reset_index(drop=True)
     lines["start_date"] = pd.to_datetime(lines.start_time, utc=True, format="ISO8601").fillna(pd.Timestamp.now(tz="UTC"))
@@ -360,6 +399,8 @@ def score(lines, df, bundles, cal=None):
     for side in ("over", "under"):
         odds = out[f"{side}_odds"] if f"{side}_odds" in out else pd.Series(np.nan, index=out.index)
         out[f"{side}_odds"] = pd.to_numeric(odds, errors="coerce").fillna(DEFAULT_ODDS)
+    if kills_miss:
+        out = correct_kills(out, kills_miss, bundles)
     return decide(out, cal)
 
 
@@ -368,16 +409,27 @@ def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
     bundles = {stat: joblib.load(f"data/model_{stat}.joblib") for stat in STATS}
     if any(b.get("features") != FEATURES for b in bundles.values()):
         sys.exit("The saved models use an older feature set. Run `python -m cs2props.model train` first.")
+    kind = bundles["kills"]["metrics"]["model"]
+    miss = json.load(open(MISS_FILE)) if os.path.exists(MISS_FILE) else None
+    if miss is not None and (miss["features"] != FEATURES or miss["kind"] != kind):
+        print(f"Ignoring {MISS_FILE}: it was measured with another model or feature set. Re-run `backtest`.")
+        miss = None
     cal = joblib.load(CAL_FILE) if os.path.exists(CAL_FILE) else None
-    if cal is not None and not (isinstance(cal, dict) and cal["features"] == FEATURES
-                                and cal["kind"] == bundles["kills"]["metrics"]["model"]):
-        print(f"Ignoring {CAL_FILE}: it was learned with another model or feature set. Re-run `backtest`.")
+    # The calibrator must have been learned on projections corrected the same way (miss_days marks those).
+    if cal is not None and not (isinstance(cal, dict) and cal["features"] == FEATURES and cal["kind"] == kind
+                                and cal.get("miss_days") == MISS_DAYS):
+        print(f"Ignoring {CAL_FILE}: it was learned with another model, feature set or kills correction. "
+              "Re-run `backtest`.")
         cal = None
-    out = score(pd.read_csv(lines_csv), df, bundles, cal and cal["cal"]).sort_values("edge", ascending=False)
+    out = score(pd.read_csv(lines_csv), df, bundles, cal and cal["cal"], miss["kills_miss"] if miss else 0.0)
+    out = out.sort_values("edge", ascending=False)
     cols = ["book", "player", "matched", "team", "opponent", "stat", "line", "proj", "p_over", "p_under", "edge", "pick"]
     out.to_csv(PICKS_CSV, index=False)
     print(out[[c for c in cols if c in out]].round(3).to_string(index=False))
     print(f"\n{(out.pick == 'NO DATA').sum()} of {len(out)} lines had no usable history (check 'matched').")
+    print(f"Kills projections are corrected by {miss['kills_miss']:+.2f}, the average miss on {miss['series']} real "
+          f"kills player-series in the {MISS_DAYS} days to {miss['through']}." if miss is not None else
+          "Kills projections are uncorrected: run `backtest` on real lines to measure their average miss.")
     print(f"P(over) is calibrated on {cal['series']} real player-series ({cal['source']}, through {cal['through']:%Y-%m-%d})."
           if cal is not None else "P(over) is the model's raw estimate: run `backtest` on real lines to learn a calibrator.")
 
@@ -425,7 +477,8 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     90 minutes (book and bo3.gg times differ by minutes; same-day rematches are 2+ hours apart). Features
     are then taken strictly before the earlier of the two start times, and the trees are refit only on
     matches before the first graded line, so the graded match never leaks into its own prediction.
-    The calibrator is fitted on the earlier 60% of graded lines and judged on the later 40%.
+    Kills projections are then corrected by the average miss of earlier lines (walk-forward), and the
+    calibrator is fitted on earlier matches and judged on later ones.
     """
     df = load(maps_csv)
     props = pd.read_csv(props_csv)  # odds-only rows (stat "match_odds") stay: score() shares them, then drops them
@@ -466,6 +519,14 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     if out.empty:
         return print("no gradable lines: the matched players have too little history before the line")
     out["result"] = np.select([out.actual > out.line, out.actual < out.line], ["OVER", "UNDER"], "PUSH")
+
+    # Kills: add the recent average miss, measured walk-forward from earlier lines' results only.
+    k_raw = out[out.stat == "kills"].drop_duplicates(["player_id", "match_start"])
+    recent = k_raw[k_raw.match_start >= k_raw.match_start.max() - pd.Timedelta(days=MISS_DAYS)]
+    live_miss = (recent.actual - recent.proj).mean()  # for `predict`, from the latest MISS_DAYS
+    before = grade(out)
+    out["kills_miss"] = recent_miss(out)
+    out = decide(correct_kills(out, out.kills_miss.to_numpy(), bundles))
     bet = grade(out)
     out.merge(bet[["units"]], left_index=True, right_index=True, how="left").to_csv(BACKTEST_CSV, index=False)
 
@@ -479,7 +540,25 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     over_rate = (out.result == "OVER")[out.result != "PUSH"].mean()
     print(f"\nBaselines: always OVER hits {over_rate:.1%}, always UNDER hits {1 - over_rate:.1%}")
     print("\nCalibration (predicted P(over) vs actual over rate):\n" + calibration(out).round(3).to_string())
+    kb, ka = before[before.stat == "kills"], bet[bet.stat == "kills"]
+    corrected = out[(out.stat == "kills") & (out.kills_miss != 0)]
+    print(f"\nKills bets before vs after the average-miss correction ({len(corrected)} of "
+          f"{(out.stat == 'kills').sum()} kills lines corrected, by {corrected.kills_miss.mean():+.2f} on average):\n" +
+          pd.DataFrame({"before": pd.concat([summary(kb), pd.Series({"over share": (kb.pick == "OVER").mean()})]),
+                        "after": pd.concat([summary(ka), pd.Series({"over share": (ka.pick == "OVER").mean()})])}
+                       ).round(3).to_string())
     print(f"\nper-line results saved to {BACKTEST_CSV}")
+    if kind == MODEL and len(recent) >= MISS_MIN:
+        # ponytail: measured against the backtest's models (trained before the first line); `train` fits fresher
+        # ones on all data, so this may over-correct slightly. A refit per month here would remove that.
+        with open(MISS_FILE, "w") as f:
+            json.dump({"kills_miss": float(live_miss), "series": len(recent), "kind": kind, "features": FEATURES,
+                       "through": f"{out.start_date.max():%Y-%m-%d}"}, f)
+        print(f"Saved {MISS_FILE}: `predict` adds {live_miss:+.2f} to kills projections "
+              f"(average miss on {len(recent)} kills player-series in the last {MISS_DAYS} days).")
+    elif kind == MODEL:
+        print(f"Only {len(recent)} kills player-series in the last {MISS_DAYS} days: {MISS_MIN} are needed to save "
+              f"a kills correction. {MISS_FILE} was left as it was.")
 
     # Learn P(over) from the real lines themselves: fit on earlier matches, judge on later ones. Copies of a
     # line at several books share one outcome, so the minimums count player-series and matches, not rows.
@@ -511,7 +590,7 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
         return print(f"The calibrator did not beat the raw model on later matches, so it was not saved. "
                      f"{CAL_FILE} was left as it was.")
     joblib.dump({"cal": fit_calibrator(out), "kind": kind, "features": FEATURES, "series": n_series,
-                 "source": str(props_csv), "through": out.start_date.max()}, CAL_FILE)
+                 "source": str(props_csv), "through": out.start_date.max(), "miss_days": MISS_DAYS}, CAL_FILE)
     print(f"Saved {CAL_FILE} (refit on all {n_series} player-series); `predict` now uses it.")
 
 

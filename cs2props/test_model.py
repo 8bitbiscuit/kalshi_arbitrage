@@ -135,6 +135,7 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
     early, bt = run(pd.Timedelta(minutes=-5)), run(pd.Timedelta(minutes=5))
     printed = capsys.readouterr().out
     assert "agrees with bo3.gg on 100.0%" in printed and "log loss" in printed
+    assert "average-miss correction" in printed and "Saved data/kills_miss.json" in printed
     saved = "Saved data/calibrator.joblib" in printed
     assert saved or "did not beat the raw model" in printed  # saved only when it wins on later matches
     pd.testing.assert_series_equal(early.proj, bt.proj)  # listing the match late must not leak its result
@@ -146,7 +147,8 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
     pd.DataFrame([dict(book="a", player="max", team="Alpha Gaming", opponent="Delta", stat="kills", maps="1-2",
                        line=30.5, start_time="2026-01-01T00:00:00Z")]).to_csv("data/lines.csv", index=False)
     model.predict()
-    assert ("calibrated on" in capsys.readouterr().out) == saved
+    printed = capsys.readouterr().out
+    assert ("calibrated on" in printed) == saved and "Kills projections are corrected by" in printed
 
 
 def test_pickfinder_history_rows():
@@ -222,3 +224,20 @@ def test_calibrator_saved_only_when_it_beats_the_raw_model(tmp_path, monkeypatch
     assert "calibrated on" in printed and "data/props.csv" in printed
     p = pd.read_csv("data/picks.csv").p_over.iloc[0]
     assert 0.3 < p < 0.7  # the calibrator pulled the raw 0.95 back toward what actually happened
+
+
+def test_recency_weights_and_walk_forward_kills_miss():
+    d = pd.DataFrame(dict(start_date=pd.to_datetime(["2026-01-01", "2025-10-03", "2025-07-05"], utc=True)))
+    assert np.allclose(model.recency(d), [1, 0.5, 0.25])  # 90-day half-life
+    # 3 kills series a day for 60 days, every one 2 kills above its projection, plus headshot lines.
+    days = pd.date_range("2026-01-01", periods=60, freq="D", tz="UTC")
+    k = pd.DataFrame([dict(stat="kills", player_id=p, match_start=t, actual=30.0, proj=28.0)
+                      for t in days for p in range(3)])
+    out = pd.concat([k, k.assign(stat="headshots", actual=15.0, proj=15.0)], ignore_index=True)
+    miss = model.recent_miss(out)
+    first, day30 = out.match_start == days[0], out.match_start == days[30]
+    assert (miss[first.to_numpy()] == 0).all()        # no earlier results yet
+    assert np.allclose(miss[day30.to_numpy()], 2.0)   # 30 earlier days x 3 series = 90 >= 50
+    # Only results from at least a day before count: a line's own match never corrects itself.
+    out.loc[out.match_start == days[30], "actual"] = 99.0
+    assert np.allclose(model.recent_miss(out)[day30.to_numpy()], 2.0)

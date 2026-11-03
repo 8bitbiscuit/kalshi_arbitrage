@@ -107,6 +107,16 @@ decider). bo3.gg's own pick/ban records stopped in mid-September 2026.
 - **Tuning:** loss (squared error or Poisson, which suits counts), learning rate 0.05 or 0.1, and 15 or
   31 leaves per tree, chosen on a validation slice by MAE. Both stats chose Poisson, 0.05 and 15.
 - **Split by time:** oldest 70% train, next 15% validate (tuning and the error spread), newest 15% test.
+- **Recent matches count more:** each training match is weighted by 0.5 per 90 days before the newest one
+  (`HALF_LIFE_DAYS`). On bo3.gg data this removed the headshot projections' slight low bias (0.03 → 0.00)
+  and only nudged kills (0.24 → 0.21 too low), at a small accuracy cost (6.047 → 6.057 kills error).
+- **Kills corrected by their recent miss:** against real lines the kills projections ran low, mostly for
+  the standout players books post props on, whom the trees pull toward the average. Each kills projection
+  gets the average (actual − projection) of real kills lines from the last 30 days added (`MISS_DAYS`),
+  once at least 50 player-series exist (`MISS_MIN`). The backtest measures this walk-forward: each line
+  only uses results from matches at least a day before it. It then saves the latest 30 days' figure to
+  `data/kills_miss.json` for `predict`. Headshots are not corrected, because the recency weights already
+  remove their bias.
 - **Calibrated on real lines:** the model alone was far too confident against real books (see section 6),
   so `backtest` learns a small logistic regression from real graded lines: how often a line went over,
   given how far the projection was from it (per stat). It is fitted on matches before a cut-off (about 60%
@@ -229,11 +239,15 @@ are two sources:
   - "always over / always under" baselines
   - a calibration table (predicted P(over) vs actual)
   - the share of lines that had a market win probability
+- **Kills correction:** it prints kills bets before and after the average-miss correction, including the
+  share of OVER picks, and saves the latest correction for `predict`. On stand-in lines the OVER share of
+  kills picks went from 33% to 48%.
 - **Calibrator:** with 300+ player-series from 30+ matches it then fits the calibrator on earlier matches,
   prints raw vs calibrated results on later ones (overall, by edge, calibration table, log loss), and
   saves it for `predict` only if its log loss is lower. Otherwise the existing file is left alone. A
   `tree` backtest never saves one. On a one-day archive of 307 lines (154 series) the first version saved a
-  calibrator that cut the later hit rate from 51.6% to 39.6%; these rules stop that.
+  calibrator that cut the later hit rate from 51.6% to 39.6%; these rules stop that. The calibrator is fitted
+  on corrected kills projections, so `predict` ignores one saved before the correction existed.
 - **Per-line results** go to `data/backtest.csv`.
 
 Only trust the picks if the hit rate beats breakeven by more than the band. At 500 bets the band is
@@ -278,7 +292,9 @@ Next steps, in order of value:
   the line moved.
 - **Monthly walk-forward refits in the backtest.** It trains once, before the first graded line. A check
   on bo3.gg data found this costs little: a model trained before August projected only about 0.2 kills
-  too low by October, and monthly refits barely changed that.
+  too low by October, and monthly refits barely changed that. Refits would also make the saved kills
+  correction exact: it is measured against the backtest's older models, so `predict`'s fresher models may
+  be corrected slightly too much.
 
 ## 7. Known limitations
 

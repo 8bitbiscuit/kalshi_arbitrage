@@ -94,6 +94,10 @@ At the top of `cs2props/model.py`:
 - `DEFAULT_ODDS` is the breakeven for apps that don't show a price. The default -119 means 54.3% per pick.
   A 2-pick power play needs -137.
 - `MODEL` is `"gbm"` for gradient boosting or `"tree"` for a single tree.
+- `HALF_LIFE_DAYS` (default 90) makes recent matches count more in training: a match that many days older
+  than the newest counts half. `None` weights every match equally. Retrain after changing it.
+- `MISS_DAYS` (30) and `MISS_MIN` (50) set the kills correction: the average miss of real kills lines over
+  the last 30 days, used once 50 player-series exist. Re-run `backtest` after changing them.
 
 ## Files in `data/`
 
@@ -107,3 +111,4 @@ At the top of `cs2props/model.py`:
 | `prop_history.csv` | `pickfinder history` | PickFinder past lines with results |
 | `backtest.csv` | `backtest` | Per-line backtest results |
 | `calibrator.joblib` | `backtest` | P(over) learned from real graded lines, used by `predict` |
+| `kills_miss.json` | `backtest` | The kills correction `predict` adds to kills projections |
