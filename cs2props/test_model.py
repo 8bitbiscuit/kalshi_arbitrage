@@ -1,5 +1,6 @@
 """python -m pytest cs2props -q"""
 import json
+import os
 
 import numpy as np
 import pandas as pd
@@ -138,6 +139,7 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
     printed = capsys.readouterr().out
     assert "agrees with bo3.gg on 100.0%" in printed and "log loss" in printed
     assert "refined per player" in printed and "Saved data/kills_miss.json" in printed
+    assert "No month-by-month summary" in printed  # fake data is a single month
     saved = "Saved data/calibrator.joblib" in printed
     assert saved or "did not beat the raw model" in printed  # saved only when it wins on later matches
     pd.testing.assert_series_equal(early.proj, bt.proj)  # listing the match late must not leak its result
@@ -229,6 +231,9 @@ def test_calibrator_saved_only_when_it_beats_the_raw_model(tmp_path, monkeypatch
     # A kills correction from another run must not be paired with this calibrator.
     miss = json.load(open("data/kills_miss.json"))
     json.dump({**miss, "kills_miss": miss["kills_miss"] + 1}, open("data/kills_miss.json", "w"))
+    model.predict()
+    assert "Ignoring data/calibrator.joblib" in capsys.readouterr().out
+    os.remove("data/kills_miss.json")  # no correction record: the calibrator must not be used either
     model.predict()
     assert "Ignoring data/calibrator.joblib" in capsys.readouterr().out
 

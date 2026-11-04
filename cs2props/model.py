@@ -492,7 +492,7 @@ def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
     cal = joblib.load(CAL_FILE) if os.path.exists(CAL_FILE) else None
     # The calibrator must come from the same backtest as the kills correction applied here.
     if cal is not None and not (isinstance(cal, dict) and cal["features"] == FEATURES and cal["kind"] == kind
-                                and cal.get("miss") == miss):
+                                and miss is not None and cal.get("miss") == miss):
         print(f"Ignoring {CAL_FILE}: it was learned with another model, feature set or kills correction. "
               "Re-run `backtest`.")
         cal = None
@@ -606,6 +606,8 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     variants = {"none": out, "global": decide(correct_kills(out, glob, bundles)),
                 "per player": decide(correct_kills(out, per_player, bundles))}
     out = variants["per player"].assign(kills_miss=per_player)
+    kills = (out.stat == "kills").to_numpy()
+    refined = int(((per_player != glob) & kills).sum())
     bet = grade(out)
     out.merge(bet[["units"]], left_index=True, right_index=True, how="left").to_csv(BACKTEST_CSV, index=False)
 
@@ -626,8 +628,11 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
         b = b[b.stat == "kills"]
         return pd.concat([summary(b), pd.Series({"over share": (b.pick == "OVER").mean(),
                                                  "proj error": k.miss.abs().mean(), "proj too low by": k.miss.mean()})])
-    print("\nKills: no correction vs the global average miss vs refined per player (all walk-forward):\n" +
+    print(f"\nKills: no correction vs the global average miss vs refined per player (all walk-forward; "
+          f"{refined} of {kills.sum()} kills lines got a per-player refinement, which needs a month of earlier lines):\n" +
           pd.DataFrame({name: kills_report(v) for name, v in variants.items()}).round(3).to_string())
+    if not refined:
+        print("No line was refined per player here, so the per-player correction `predict` will use is untested.")
     print(f"\nper-line results saved to {BACKTEST_CSV}")
 
     saved = None
@@ -691,13 +696,16 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     if len(wf):
         raw_b, cal_b = grade(out.loc[wf.index]), grade(wf)
         row = lambda b: pd.concat([summary(b), pd.Series({"over share": (b.pick == "OVER").mean()})])  # noqa: E731
-        print(f"\n===== Summary: calibrated model, backtested month by month ({len(wf)} lines, "
+        print(f"\n===== Summary: calibrated model, backtested month by month ({len(wf)} of {len(out)} lines, "
               f"{wf.start_date.min():%Y-%m-%d} to {wf.start_date.max():%Y-%m-%d}; each month's calibrator learned "
               f"only from earlier months) =====\n" +
               pd.DataFrame({"uncalibrated": row(raw_b), "calibrated": row(cal_b)}).round(3).to_string())
         if len(cal_b):
             print("\nCalibrated, by stat:\n" +
                   cal_b.groupby("stat").apply(summary, include_groups=False).round(3).to_string())
+    else:
+        print("\nNo month-by-month summary: no calendar month had 300 player-series and 30 matches before it "
+              "(the first month is never scored, since its calibrator could only learn from earlier months).")
     print("\n" + status)
 
 
