@@ -154,7 +154,10 @@ the CS2 launch (174,165 player-series, model trained before 08-04):
   from 6.04 to 4.95, and losing 0-2 in under 35 rounds leaves a player at 0.56× their usual kills (a blowout
   win: 0.95×). But expected closeness correlates only -0.14 with the actual rounds, and a dedicated pre-match
   rounds model explains under 3% of their variance. Player-based ratings from round scores predicted map
-  winners better than the Elo (log-loss 0.639 vs 0.645) yet moved kills MAE by under 0.1%.
+  winners better than the Elo (log-loss 0.639 vs 0.645) yet moved kills MAE by under 0.1%. One trace
+  remains: heavy underdogs (Elo win chance 20-35%) are over-projected by about 0.3 kills in both windows,
+  mostly in tiers B-D. A dedicated blowout model didn't fix it reliably; the market's win probability is the
+  likeliest input that would.
 - **Maps barely matter.** Even the *actual* maps 1-2 (the player's KPR on them, each team's strength on them)
   left kills MAE at 6.05, though the map-pool guess catches only 45% of the maps played.
 
@@ -222,9 +225,9 @@ are two sources:
   within 90 minutes. Book and bo3.gg times differ by minutes, while same-day rematches are 2+ hours apart.
   Lines whose series isn't in bo3.gg are not graded rather than graded against the wrong match.
 - **No look-ahead, walk-forward:**
-  - Each calendar month's lines are scored by trees refit on every match before that month began
-    (settings tuned once, on the first month), like a regular `train` would. A single model fitted before
-    the first line was up to three months stale by the last one.
+  - Each calendar month's lines are scored by trees refit on every match that started at least a day
+    before that month (so all had finished; settings tuned once, on the first month), like a regular
+    `train` would. A single model fitted before the first line was up to three months stale by the last one.
   - Features are taken strictly before the *earlier* of the book's and bo3.gg's start time. Books and
     PickFinder often list a start a few minutes after bo3.gg does, and using the later time let the graded
     match into its own features (a test now checks this).
@@ -239,14 +242,17 @@ are two sources:
   - "always over / always under" baselines
   - a calibration table (predicted P(over) vs actual)
   - line shopping: where two books post different lines on one series, how often the side the gap favours
-    wins (over at the lower line, under at the higher), with no model at all
+    wins (over at the lower line, under at the higher), with no model at all. Our archive's lines are only
+    compared within one scrape; PickFinder's carry no time, so there the two lines may never have coexisted
 - **Calibrated against the books.** The model never sees the line, so it is overconfident whenever it
   disagrees with it (in the first real backtest the 10%+ edge bets hit 48%, worse than the 0-5% ones). The
   backtest fits `P(over) = sigmoid(a + b × logit(model P(over)))` per stat on graded lines, walk-forward (a
-  month is calibrated only on earlier months), and reports the calibrated picks next to the raw ones.
-  `b` is how much of the model's disagreement with the line is real (1 all of it, 0 none) and `a` is its
-  lean to one side: watch `b` when changing features. The fit on all graded lines is saved to
-  `data/calibration.joblib`, and `predict` uses it while the feature list is unchanged.
+  month is calibrated only on lines settled before it began), and reports the calibrated picks next to the
+  raw ones. `b` is how much of the model's disagreement with the line is real (1 all of it, 0 none) and `a`
+  is its lean to one side: watch `b` when changing features. A stat needs 300 decided lines to be
+  calibrated at all (smaller samples give wild fits). The fit on all graded lines is saved to
+  `data/calibration.joblib` (a smaller file never replaces it), and `predict` uses it while the feature
+  list and model kind are unchanged.
 - **Per-line results** go to `data/backtest.csv` (raw and `_cal` columns).
 
 Only trust the picks if the hit rate beats breakeven by more than the band. At 500 bets the band is

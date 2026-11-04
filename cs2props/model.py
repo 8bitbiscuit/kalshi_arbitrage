@@ -265,34 +265,34 @@ def logit(p):
 
 
 def cal_x(d):
-    """Calibration inputs: the model's logit P(over | no push), with a separate intercept and slope per stat."""
-    x = logit(d.p_over / (d.p_over + d.p_under))
-    hs = (d.stat == "headshots").to_numpy(float)
-    return np.c_[x, x * hs, hs]
+    """Calibration input: the model's logit P(over | no push)."""
+    return logit(d.p_over / (d.p_over + d.p_under))[:, None]
 
 
 def fit_calibration(graded):
-    """P(over) against real lines = sigmoid(a + b * model logit), per stat, fitted on graded past lines.
+    """{stat: P(over) against real lines = sigmoid(a + b * model logit)}, fitted on graded past lines, for each
+    stat with MIN_CAL_LINES decided lines (fewer give wild fits; that stat stays uncalibrated).
 
     The books' line is the strongest single predictor there is, so a model that ignores it is overconfident
     whenever it disagrees with it: b < 1 measures by how much, a measures a lean toward one side."""
     d = graded[graded.result.isin(["OVER", "UNDER"]) & graded.p_over.notna()]
-    return LogisticRegression().fit(cal_x(d), d.result == "OVER") if d.result.nunique() == 2 else None
+    return {stat: LogisticRegression().fit(cal_x(g), g.result == "OVER") for stat, g in d.groupby("stat")
+            if len(g) >= MIN_CAL_LINES and g.result.nunique() == 2}
 
 
 def describe_calibration(cal):
-    a, (b, b_hs, a_hs) = cal.intercept_[0], cal.coef_[0]
-    return (f"kills a={a:+.2f} b={b:.2f} | headshots a={a + a_hs:+.2f} b={b + b_hs:.2f} "
-            "(b = how much of the model's disagreement with the line is real: 1 all of it, 0 none)")
+    return (" | ".join(f"{stat} a={lr.intercept_[0]:+.2f} b={lr.coef_[0, 0]:.2f}" for stat, lr in cal.items())
+            + " (b = how much of the model's disagreement with the line is real: 1 all of it, 0 none)")
 
 
 def calibrated(out, cal):
-    """Replace P(over/under) with the calibrated ones; the push probability is unchanged."""
-    m = out.p_over.notna()
-    if cal is not None and m.any():
-        keep = (out.p_over + out.p_under)[m]
-        p = cal.predict_proba(cal_x(out[m]))[:, 1]
-        out.loc[m, "p_over"], out.loc[m, "p_under"] = p * keep, (1 - p) * keep
+    """Replace P(over/under) with the calibrated ones for each stat in `cal`; the push probability is unchanged."""
+    for stat, lr in (cal or {}).items():
+        m = out.p_over.notna() & (out.stat == stat)
+        if m.any():
+            keep = (out.p_over + out.p_under)[m]
+            p = lr.predict_proba(cal_x(out[m]))[:, 1]
+            out.loc[m, "p_over"], out.loc[m, "p_under"] = p * keep, (1 - p) * keep
     return out
 
 
@@ -330,14 +330,18 @@ def score(lines, df, bundles, cal=None):
 def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
     df = load(maps_csv)
     bundles = {stat: joblib.load(f"data/model_{stat}.joblib") for stat in STATS}
+    if any(list(b["model"].feature_names_in_) != FEATURES for b in bundles.values()):
+        return print("The saved models predate the current features: run python -m cs2props.model train first.")
     saved = joblib.load(CAL_JOBLIB) if os.path.exists(CAL_JOBLIB) else {}
-    cal = saved.get("cal") if saved.get("features") == FEATURES else None  # a calibration of other features is stale
+    # Only a calibration of these features and this kind of model applies; any other is stale.
+    same = (saved.get("features"), saved.get("kind")) == (FEATURES, bundles["kills"]["metrics"]["model"])
+    cal = saved.get("cal") if same else None
     out = score(pd.read_csv(lines_csv), df, bundles, cal).sort_values("edge", ascending=False)
     cols = ["book", "player", "matched", "team", "opponent", "stat", "line", "proj", "p_over", "p_under", "edge", "pick"]
     out.to_csv(PICKS_CSV, index=False)
     print(out[[c for c in cols if c in out]].round(3).to_string(index=False))
     print(f"\n{(out.pick == 'NO DATA').sum()} of {len(out)} lines had no usable history (check 'matched').")
-    print(f"P(over/under) calibrated on real past lines ({CAL_JOBLIB}): {describe_calibration(cal)}" if cal is not None else
+    print(f"P(over/under) calibrated on real past lines ({CAL_JOBLIB}): {describe_calibration(cal)}" if cal else
           f"P(over/under) NOT calibrated on real lines: run backtest first (it writes {CAL_JOBLIB}).")
 
 
@@ -390,8 +394,9 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     Each line is first matched to its own bo3.gg series: same player and opponent, starting within
     90 minutes (book and bo3.gg times differ by minutes; same-day rematches are 2+ hours apart). Features
     are then taken strictly before the earlier of the two start times, and each calendar month's series are
-    scored by trees refit on matches before that month began, so the graded match never leaks into its own
-    prediction. The calibration against real lines is walk-forward too: a month only uses earlier months.
+    scored by trees refit on matches that started at least a day before that month, so nothing graded leaks
+    into a prediction. The calibration against real lines is walk-forward too: a month only uses lines that
+    were settled before it began.
     """
     df = load(maps_csv)
     props = pd.read_csv(props_csv)
@@ -407,20 +412,23 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     props["start_time"] = props.start_date.where(props.start_date < props.match_start, props.match_start)
     if "scraped_at" in props:  # our archive: each book's last snapshot before the match is its closing line
         props = props[pd.to_datetime(props.scraped_at, utc=True, format="ISO8601") < props.start_time]
-        props = props.sort_values("scraped_at").drop_duplicates(["book", "player_id", "stat", "maps", "match_start"],
-                                                                keep="last")
+        props = props.sort_values("scraped_at")
+    # One line per book per series (PickFinder can list a rescheduled match twice, a day apart).
+    props = props.drop_duplicates(["book", "player_id", "stat", "maps", "match_start"], keep="last")
     if props.empty:
         return print("no gradable lines: none matched a bo3.gg series of that player vs that opponent "
                      "(run history first; the match may not be finished)")
 
     feats = features(series(df), df)
     # Walk forward like a regular `train` would: each month's series are scored by trees refit on every match
-    # before that calendar month (settings tuned once, on the first). One stale model let kill levels drift.
+    # that started a day or more before that calendar month, so all had finished before its first line (settings
+    # tuned once, on the first month). One model fitted before the first line drifted: its bias grew from -0.1 to
+    # +1.0 kills over three months.
     props["month"] = props.match_start.dt.strftime("%Y-%m")
+    known = lambda m: pd.Timestamp(f"{m}-01", tz="UTC") - pd.Timedelta(days=1)  # noqa: E731
     parts, params = [], None
     for month, chunk in props.groupby("month"):
-        bundles = fit_models(feats[feats.start_date < pd.Timestamp(f"{month}-01", tz="UTC")], kind, verbose=False,
-                             params=params)
+        bundles = fit_models(feats[feats.start_date < known(month)], kind, verbose=False, params=params)
         params = {stat: b["params"] for stat, b in bundles.items()}
         parts.append(score(chunk.drop(columns=["start_date", "player_id", "team_id", "opp_id", "matched"]), df, bundles))
     out = pd.concat(parts, ignore_index=True)
@@ -441,18 +449,25 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     over_rate = (out.result == "OVER")[out.result != "PUSH"].mean()
     print(f"\nBaselines: always OVER hits {over_rate:.1%}, always UNDER hits {1 - over_rate:.1%}")
     # Line shopping, no model: where books post different lines on one series, take the side the gap favours.
-    key = ["player_id", "stat", "match_start"]
+    # Our archive's lines are compared within one scrape only (a pulled line next to another book's later,
+    # moved one was never on offer). PickFinder's lines carry no time, so there the books may not overlap.
+    timed = "scraped_at" in out
+    key = ["player_id", "stat", "match_start"] + (["scraped_at"] if timed else [])
     lo, hi = (out.groupby(key).line.transform(f) for f in ("min", "max"))
     o, u = out[(hi > lo) & (out.line == lo)], out[(hi > lo) & (out.line == hi)]
     if len(o):
-        print(f"Line shopping, {o.groupby(key).ngroups} series where books disagree: OVER at the lowest line hits "
-              f"{(o.result == 'OVER')[o.result != 'PUSH'].mean():.1%}, UNDER at the highest hits "
-              f"{(u.result == 'UNDER')[u.result != 'PUSH'].mean():.1%} (gap {(hi - lo)[hi > lo].mean():.1f} on average)")
+        print(f"Line shopping{'' if timed else ' (untimed lines)'}, {o.groupby(key).ngroups} series where books "
+              f"disagree by {(hi - lo)[hi > lo].mean():.1f} on average: OVER at the lowest line hits "
+              f"{(o.result == 'OVER')[o.result != 'PUSH'].mean():.1%} (breakeven "
+              f"{o.over_odds.map(american_to_prob).mean():.1%}), UNDER at the highest hits "
+              f"{(u.result == 'UNDER')[u.result != 'PUSH'].mean():.1%} (breakeven "
+              f"{u.under_odds.map(american_to_prob).mean():.1%})")
 
-    # Calibrated against the books, walk-forward: each month is calibrated on earlier months' graded lines only.
-    cal_parts = [picks(calibrated(out[out.month == m].copy(), fit_calibration(out[out.month < m])))
-                 for m in sorted(out.month.unique())
-                 if out[out.month < m].result.isin(["OVER", "UNDER"]).sum() >= MIN_CAL_LINES]
+    # Calibrated against the books, walk-forward: each month is calibrated only on lines settled before it began
+    # (and only for the stats that had enough of them).
+    cals = {m: fit_calibration(out[out.match_start < known(m)]) for m in sorted(out.month.unique())}
+    cal_parts = [picks(calibrated(out[(out.month == m) & out.stat.isin(list(cal))].copy(), cal))
+                 for m, cal in cals.items() if cal]
     if cal_parts:
         cal_out = pd.concat(cal_parts)
         same = summary(bets(out.loc[cal_out.index]))
@@ -460,12 +475,16 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
         print(f"\nUncalibrated on these same lines: {same.bets:.0f} bets, hit {same.hit:.3f}, roi {same.roi:+.3f}")
         out = out.join(cal_out[["p_over", "p_under", "edge", "pick"]].add_suffix("_cal"))
     else:
-        print(f"\n(Calibrated report needs {MIN_CAL_LINES}+ graded lines from an earlier month.)")
+        print(f"\n(Calibrated report needs {MIN_CAL_LINES}+ graded lines of a stat from before a month.)")
     cal = fit_calibration(out)
-    if cal is not None:
-        joblib.dump({"cal": cal, "features": FEATURES}, CAL_JOBLIB)
-        print(f"\nCalibration fitted on all {len(out)} graded lines, used by predict ({CAL_JOBLIB}):\n   "
+    if cal:  # a small file must not replace a well-founded calibration
+        lines = out[out.result.isin(["OVER", "UNDER"])].stat.value_counts()
+        joblib.dump({"cal": cal, "features": FEATURES, "kind": kind, "lines": {s: int(lines[s]) for s in cal}},
+                    CAL_JOBLIB)
+        print(f"\nCalibration fitted on all graded lines, used by predict ({CAL_JOBLIB}):\n   "
               + describe_calibration(cal))
+    else:
+        print(f"\nCalibration not saved (no stat had {MIN_CAL_LINES} decided lines); {CAL_JOBLIB} unchanged.")
     out.merge(bet[["units"]], left_index=True, right_index=True, how="left").to_csv(BACKTEST_CSV, index=False)
     print(f"\nper-line results saved to {BACKTEST_CSV}")
 

@@ -1,4 +1,5 @@
 """python -m pytest cs2props -q"""
+import joblib
 import numpy as np
 import pandas as pd
 
@@ -117,7 +118,7 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
     early, bt = run(pd.Timedelta(minutes=-5)), run(pd.Timedelta(minutes=5))
     out = capsys.readouterr().out
     assert "agrees with bo3.gg on 100.0%" in out and "Calibrated on earlier months' lines" in out
-    assert "Line shopping" in out and "(gap 1.0 on average)" in out
+    assert "Line shopping (untimed lines)" in out and "disagree by 1.0 on average" in out
     pd.testing.assert_series_equal(early.proj, bt.proj)  # listing the match late must not leak its result
     assert len(bt) >= 0.95 * len(late)  # a few series fail load()'s sanity checks and are not graded
     assert (bt[bt.player == "max"].pick == "OVER").mean() > 0.9
@@ -125,6 +126,11 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
     assert bt.units.sum() > 0
     april = bt.month == "2025-04"
     assert bt.pick_cal[~april].isna().all() and (bt.pick_cal[april] == bt.pick[april]).mean() > 0.9
+    saved = joblib.load(model.CAL_JOBLIB)
+    assert saved["kind"] == "gbm" and saved["lines"]["kills"] > 100 and set(saved["cal"]) == {"kills"}
+    monkeypatch.setattr(model, "MIN_CAL_LINES", 10_000)  # too few lines now: the saved calibration must survive
+    run(pd.Timedelta(minutes=5))
+    assert "Calibration not saved" in capsys.readouterr().out and joblib.load(model.CAL_JOBLIB)["lines"] == saved["lines"]
 
 
 def test_calibration_shrinks_an_overconfident_model():
@@ -133,7 +139,7 @@ def test_calibration_shrinks_an_overconfident_model():
     over = rng.random(6000) < 0.54 + 0.4 * (p - 0.5)
     g = pd.DataFrame(dict(p_over=p, p_under=1 - p, stat="kills", result=np.where(over, "OVER", "UNDER")))
     cal = model.fit_calibration(g)
-    assert 0.25 < cal.coef_[0, 0] < 0.6  # slope in logit units: ~0.4
+    assert set(cal) == {"kills"} and 0.25 < cal["kills"].coef_[0, 0] < 0.6  # slope in logit units: ~0.4
     c = model.calibrated(g.copy(), cal)
     assert abs(c.p_over.mean() - over.mean()) < 0.01 and c.p_over.std() < 0.5 * p.std()
 

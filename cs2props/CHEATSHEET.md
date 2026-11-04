@@ -31,7 +31,7 @@ python -m cs2props.model predict
 
 ## Model
 
-Retrain about weekly:
+Retrain about weekly, and always after pulling a change to the model's features (old models can't score them):
 
 ```bash
 python -m cs2props.model train
