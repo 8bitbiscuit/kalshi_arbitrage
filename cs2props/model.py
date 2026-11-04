@@ -28,7 +28,7 @@ PROPS_CSV, BACKTEST_CSV, CAL_JOBLIB = "data/prop_history.csv", "data/backtest.cs
 MIN_CAL_LINES = 300  # graded lines from earlier months needed before a month gets a calibrated score
 STATS = ("kills", "headshots")
 FEATURES = ["kills_l20", "kills_l5", "headshots_l20", "hs_pct", "kpr", "adr_l20", "kast_l20", "rounds_l20",
-            "maps_played", "map_factor", "win_prob", "elo_opp"]
+            "maps_played", "map_factor", "win_prob", "elo_opp", "sched_gap"]
 # Rows lacking these are skipped (fewer than 5 maps of history). Other features may be NaN (e.g. a
 # missing ADR); scikit-learn trees handle NaN natively.
 NEED = {"kills": ["kills_l20", "kpr", "map_factor"], "headshots": ["kills_l20", "kpr", "map_factor", "hs_pct"]}
@@ -67,11 +67,16 @@ def load(path=MAPS_CSV):
     return df.sort_values(["start_date", "match_id", "map_number"], kind="stable").reset_index(drop=True)
 
 
-def player_state(df, maps):
-    """Each player's form *after* each match (windows include that match's maps)."""
+def player_state(df, maps, ts):
+    """Each player's form *after* each match (windows include that match's maps), and opp_elo_l20: the mean
+    pre-match Elo of the opponents behind it (ts = team_state)."""
+    opp = ts[["team_id", "start_date", "elo"]].rename(columns={"team_id": "opp_id", "elo": "opp_elo"})
+    df = df.assign(opp_elo=pd.merge_asof(df[["start_date", "opp_id"]], opp, on="start_date", by="opp_id",
+                                         allow_exact_matches=False).opp_elo.fillna(1500.0).to_numpy())
     g = df.groupby("player_id")
     st = df[["player_id", "start_date"]].copy()
-    for col, n in [("kills", 20), ("kills", 5), ("headshots", 20), ("rounds", 20), ("adr", 20), ("kast", 20)]:
+    for col, n in [("kills", 20), ("kills", 5), ("headshots", 20), ("rounds", 20), ("adr", 20), ("kast", 20),
+                   ("opp_elo", 20)]:
         st[f"{col}_l{n}"] = g[col].transform(lambda s: s.rolling(n, min_periods=min(n, 5)).mean())
     st["hs_pct"] = st.headshots_l20 / st.kills_l20
     st["maps_played"] = np.minimum(g.cumcount() + 1, 100)  # capped: a thin-history flag, not a calendar proxy
@@ -109,7 +114,8 @@ def team_state(df, maps):
 def features(q, df):
     """Features for queries (player_id, team_id, opp_id, start_date) from state strictly before start_date."""
     maps = sorted(df.map_name.dropna().unique())
-    ps, ts = player_state(df, maps), team_state(df, maps)
+    ts = team_state(df, maps)
+    ps = player_state(df, maps, ts)
     opp = ts.rename(columns=lambda c: {"team_id": "opp_id", "elo": "elo_opp"}.get(c, c.replace("pool_", "opp_pool_")))
     f = q.sort_values("start_date", kind="stable")
     for right, by in ((ps, "player_id"), (ts, "team_id"), (opp, "opp_id")):
@@ -125,6 +131,10 @@ def features(q, df):
         f["map_factor"] = np.where(w.sum(1) > 0, (w * map_kpr).sum(1) / w.sum(1) / kpr[:, 0], 1.0)
     f["elo_opp"] = f.elo_opp.fillna(1500.0)
     f["win_prob"] = 1 / (1 + 10 ** ((f.elo_opp - f.elo.fillna(1500.0)) / 400))
+    # Is today's opponent tougher than the ones behind the player's 20-map averages? Without it, a player who
+    # farmed weaker teams looks better than they are against a strong one. Unlike elo_opp it doesn't drift: top-tier
+    # Elo inflated from about 1550 in 2023 to 1900 in 2026, so the model came to under-project tier-1 players.
+    f["sched_gap"] = f.elo_opp - f.opp_elo_l20
     return f
 
 

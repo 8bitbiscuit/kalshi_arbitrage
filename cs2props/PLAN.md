@@ -67,6 +67,7 @@ The same things PickFinder shows in the screenshots, built so nothing from the p
 | `adr_l20`, `kast_l20` | Damage per round, KAST | K/D, rating |
 | `map_factor` | Player's KPR on each map (shrunk toward overall KPR with a 100-round prior), weighted by how often **both teams** played each map in their last 15 maps, divided by overall KPR | Map Picks + per-map Kills/KPR |
 | `win_prob`, `elo_opp` | Map-level Elo built from every bo3.gg result; win probability for the player's team and opponent strength. A team id seen for the first time (a roster moving org, e.g. LP to BARCA) starts from its players' previous teams' ratings | Moneyline implied win % |
+| `sched_gap` | Today's opponent Elo minus the mean pre-match Elo of the player's last 20 opponents, so a 20-map average earned against weaker (or stronger) teams than today's is not taken at face value. Unlike `elo_opp` it doesn't drift with Elo inflation | Opponent rank vs recent schedule |
 | `maps_played` | Experience; lets the model distrust thin histories | sample size |
 
 Why map pool, not actual maps: lines lock before the veto, and bo3.gg has had no veto data since
@@ -128,13 +129,46 @@ September), boosting vs tree:
 | Hit rate on bets with 10%+ edge | 71.3% | 67.0% |
 
 The stand-in lines are softer than real books, so only the comparison means anything, and the overall
-gap is inside the noise. Both models also predicted P(over) about 5 points too low in that period,
-because kill levels rose after their training cutoff. Real PickFinder lines are the deciding test.
+gap is inside the noise. Both models also predicted P(over) about 5 points too low in that period (traced
+in November to stale models and Elo inflation, not kill levels, which were flat: see below). Real
+PickFinder lines are the deciding test.
 
 On the 2026-10-30 slate (156 lines), projections averaged within 0.03 kills and 0.21 headshots of the
 books' lines (standard deviations 1.5 and 1.4). The model agrees with the books on level, so any edge
 lives in disagreements of 1-2 kills. That is also why the stand-in hit rate (about 60%) is no guide to
 real profit.
+
+### November 2026: why it leaned UNDER, and what moves kills
+
+The first real backtest (3,210 lines, 2026-08-04 to 11-03) bet UNDER 1,726 times and OVER 597 times, with
+mean P(over) 0.456 against an actual over rate of 0.495. Replaying that window on all bo3.gg series since
+the CS2 launch (174,165 player-series, model trained before 08-04):
+
+- **League levels were flat** (maps 1-2 kills 28.5-29.1 every quarter since 2023), so the lean was the model.
+- **Stale models.** The saved model left out the newest 15% of data, and the backtest used one model for three
+  months: kills bias grew from -0.1 in August to +1.0 in early November. Fixed (refit on all rows, monthly).
+- **Elo inflation.** Tier S/A opponents' mean Elo rose from 1555 (late 2023) to 1919 (late 2026), so a model
+  that learned "1850 = elite" under-projected tier-1 players: their actual kills beat the model's median 53.2%
+  of the time. `sched_gap` (today's opponent against the ones behind the player's averages) fixed it.
+- **Blowouts matter after the fact, not before.** Knowing the actual rounds of maps 1-2 would cut kills MAE
+  from 6.04 to 4.95, and losing 0-2 in under 35 rounds leaves a player at 0.56× their usual kills (a blowout
+  win: 0.95×). But expected closeness correlates only -0.14 with the actual rounds, and a dedicated pre-match
+  rounds model explains under 3% of their variance. Player-based ratings from round scores predicted map
+  winners better than the Elo (log-loss 0.639 vs 0.645) yet moved kills MAE by under 0.1%.
+- **Maps barely matter.** Even the *actual* maps 1-2 (the player's KPR on them, each team's strength on them)
+  left kills MAE at 6.05, though the map-pool guess catches only 45% of the maps played.
+
+Same test window, production code:
+
+| | Kills MAE | Kills bias | Actual above the model's median, all / tier S/A | Headshots bias |
+|---|---|---|---|---|
+| Before | 6.050 | +0.16 | 50.8% / 53.2% | +0.15 |
+| After (refit on all rows, `sched_gap`) | 6.040 | -0.02 | 50.0% / 50.0% | +0.04 |
+
+Tried and dropped (no gain on both the May-August and the August-November windows): ratings from round
+scores, team or player based, with per-map strength; expected closeness and blowout features; long-run
+form (100-map KPR, kill share, team round share); tier; a win-chance gap; fitting the stat as a ratio to the
+player's own average (it fixes top-decile headshots, +0.34 to +0.18, but shifts the bias to the bottom decile).
 
 ## 4. Current lines
 

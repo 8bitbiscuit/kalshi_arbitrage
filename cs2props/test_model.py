@@ -32,6 +32,7 @@ def test_features_never_see_the_match_being_predicted():
     df = fake_maps(60)
     a = model.features(model.series(df), df)
     df.loc[df.match_id == 59, ["kills", "headshots"]] += 100
+    df.loc[df.match_id == 59, "win"] = 1 - df.win  # results move Elo, which sched_gap uses
     b = model.features(model.series(df), df)
     cols = ["match_id", "player_id"] + model.FEATURES
     pd.testing.assert_frame_equal(a[a.match_id == 59][cols], b[b.match_id == 59][cols])
