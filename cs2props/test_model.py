@@ -169,7 +169,8 @@ def test_pickfinder_history_rows():
               prizepicks=dict(outcomes=dict(over=side(-119, pp.format("o")), under=side(-119, pp.format("u")))),
               underdog=dict(outcomes=dict(over=side(-115), under=side(-115))),
               goblin=dict(outcomes=dict(over=side(-155, modifier="goblin")))),
-        entry("2025-11-01-133719", 26.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-110)))),
+        {**entry("2025-11-01-133719", 26.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-110)))),
+         "team_ml_percent": 0.6154, "opponent_ml_percent": 0.3846},
         entry("2025-11-09-133719", 25.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-115)))),  # not played
         entry("2025-09-07-500", 27.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-115)))),  # ambiguous
         entry("2025-09-01-77", 27.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-115)))),
@@ -179,34 +180,15 @@ def test_pickfinder_history_rows():
         ("prizepicks", "DENDELE CS", 28.5, 30, -119), ("underdog", "DENDELE CS", 26.5, 30, -115),
         ("underdog", "PARIVISION", 26.5, 20, -110)]
     assert rows[0]["start_time"].startswith("2025-10-26T16:34") and rows[0]["team"] == "G2"
+    assert np.isnan(rows[0]["market_win_prob"]) and abs(rows[2]["market_win_prob"] - 0.5776) < 0.001
 
 
-# Trimmed from a real PickFinder response: /api/cs2/matches/202611045E87085E/odds?map=1, G2 vs Aurora, 7 h before it.
-ODDS = {"id": "202611045E87085E", "num_periods": 3, "home_team_id": "BE26425B2116", "away_team_id": "E0C50B15FE2E",
-        "teams": {"BE26425B2116": {"moneyline": {"market_id": "moneyline", "name": "G2", "price": 115}},
-                  "E0C50B15FE2E": {"moneyline": {"market_id": "moneyline", "name": "Aurora Gaming", "price": -161}}}}
-
-
-def test_market_win_prob_from_match_odds():
+def test_map_win_prob():
     from cs2props import pickfinder
-    g2 = pickfinder.map_win_probs(ODDS)["g2"]  # series 43.0% after the vig -> 45.3% a map, best of 3
-    assert abs(g2 - 0.453) < 0.002 and abs(g2 + pickfinder.map_win_probs(ODDS)["aurora"] - 1) < 1e-3
-    assert pickfinder.map_win_probs({**ODDS, "num_periods": 5})["g2"] > g2  # a best of 5 stretches gaps further
-
-    calls, cache = [], {}
-
-    def page(path, **params):
-        calls.append(path)
-        return ODDS
-
-    item = dict(player_name="huNter-", game=dict(id="202611045E87085E"), team=dict(name="G2 Esports"),
-                opponent=dict(name="Aurora"))
-    assert abs(pickfinder.market_win_prob(page, item, cache) - g2) < 1e-9
-    assert abs(pickfinder.market_win_prob(page, {**item, "team": dict(name="Aurora"), "opponent": dict(name="G2")},
-                                          cache) - (1 - g2)) < 1e-3
-    assert calls == ["/api/cs2/matches/202611045E87085E/odds"]  # one request per match
-    assert np.isnan(pickfinder.market_win_prob(page, {**item, "opponent": dict(name="Vitality")}, cache))  # no guess
-    assert np.isnan(pickfinder.market_win_prob(page, dict(team=dict(name="G2")), cache))  # no fixture id
+    # A real props item (Legacy vs B8, 2026-11-03): team_ml -200, opponent_ml +140, team_ml_percent 0.6154
+    legacy, b8 = pickfinder.map_win_prob(0.6154), pickfinder.map_win_prob(0.3846)
+    assert abs(legacy - 0.5776) < 0.001 and abs(legacy + b8 - 1) < 1e-3 and pickfinder.map_win_prob(0.5) == 0.5
+    assert all(np.isnan(pickfinder.map_win_prob(x)) for x in (None, 0, 1, float("nan")))  # missing, not a certainty
 
 
 def test_lines_market_and_history(tmp_path, monkeypatch):

@@ -2,7 +2,7 @@
 
     python -m cs2props.lines               # PrizePicks + Underdog + Sleeper public JSON feeds, no login
     python -m cs2props.lines --pickfinder  # also every book PickFinder tracks (DraftKings Pick6, Dabble, ...)
-                                           # and the market's win chance for each match, from its odds
+                                           # and the market's win chance for each match
 
 --pickfinder logs in with Selenium using the PICKFINDER_EMAIL and PICKFINDER_PASSWORD environment
 variables, then reads PickFinder's own JSON API with the session token instead of screenshots + OCR.
@@ -99,15 +99,14 @@ def sleeper():
 
 
 def pickfinder():
-    from cs2props.pickfinder import current_props, main_prices, market_win_prob, session  # Selenium; see pickfinder.py
+    from cs2props.pickfinder import current_props, main_prices, map_win_prob, session  # Selenium; see pickfinder.py
 
     with session() as get:
-        odds = {}  # fixture id -> win chances: one odds request per match
         for it in current_props(get):
             if it.get("isAltLine"):
                 continue
             team, opp = (team_key((it.get(k) or {}).get("name")) for k in ("team", "opponent"))
-            win = market_win_prob(get.page, it, odds)
+            win = map_win_prob(it.get("team_ml_percent"))  # Thunderpick's moneyline, vig removed, per map
             if win == win:  # not NaN
                 MARKET[f"{team}|{opp}"] = win
             for book, app in (it.get("apps") or {}).items():

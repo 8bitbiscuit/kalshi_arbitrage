@@ -6,15 +6,17 @@
 Set PICKFINDER_EMAIL and PICKFINDER_PASSWORD; a Firefox window opens and logs in.
 
 Where the data comes from (found with `discover` on 2026-11-02):
-  - api-v2 GET /props?sport=cs2 lists current props: player ids, names and OpticOdds ids (player_oo_id).
+  - api-v2 GET /props?sport=cs2 lists current props: player ids, names and OpticOdds ids (player_oo_id), the
+    fixture_id, and the market's win chances: team_ml / opponent_ml (Thunderpick moneyline) and
+    team_ml_percent / opponent_ml_percent (the same with the vig removed; checked on 2026-11-04).
   - api-v2 GET /players/{player_id}/gamelog has every series with per-map stats: the results.
   - www GET /api/players/{player_oo_id}/props/historical?stat=Maps 1-2 Kills is the Prop History panel:
-    one entry per past match with the line, each book's prices and both teams' implied win chances. Its
-    matchKey is "<scheduled US Eastern date>-<opponent id>", and the opponent id is the gamelog's vsId.
+    one entry per past match with the line, each book's prices and both teams' implied win chances (read as
+    team_ml_percent, the props list's name; `history` prints how many entries had it). Its matchKey is
+    "<scheduled US Eastern date>-<opponent id>", and the opponent id is the gamelog's vsId.
     It is a website route, so it is called from inside the logged-in page (it uses cookies, not a token).
-  - www GET /api/cs2/matches/{fixture id}/odds?map=1 is a match's odds (2026-11-04 discover): Thunderpick's
-    series moneyline per team, map handicap, total maps, correct scores and the map-1 moneyline. Fixture ids are
-    OpticOdds', e.g. 202611045E87085E.
+  - www GET /api/cs2/matches/{fixture_id}/odds?map=1 is a match's odds: Thunderpick's series moneyline, map
+    handicap, total maps, correct scores and the map-1 moneyline (unused: the props list has the moneyline).
 """
 import json
 import os
@@ -22,14 +24,12 @@ import re
 import sys
 import time
 from contextlib import contextmanager
-from math import comb
 from urllib.parse import quote, urlencode
 
 import numpy as np
 import pandas as pd
 
 from cs2props.lines import COLS, http
-from cs2props.model import american_to_prob, team_key
 
 API, SITE = "https://api-v2.pickfinder.app", "https://www.pickfinder.app"
 MARKETS = {"Maps 1-2 Kills": "kills", "Maps 1-2 HS": "headshots"}  # PickFinder's display names
@@ -92,40 +92,15 @@ def current_props(get):
         page += 1
 
 
-# An OpticOdds fixture id, e.g. "202611045E87085E". It is found in a props item by its format, because the props
-# response that carries it hasn't been inspected; a prop without one simply gets no market odds.
-FIXTURE = re.compile(r'"(\d{8}[0-9A-F]{8})"')
-
-
-def map_win_probs(odds):
-    """{team_key(name): the market's chance to win a map} from a match-odds response: the series moneyline with
-    the vig removed, then the per-map chance that wins a best-of-num_periods series that often (maps independent),
-    so it means what the model's Elo win_prob means."""
-    ml = [t.get("moneyline") or {} for t in (odds.get("teams") or {}).values()]
-    implied = {team_key(m.get("name")): american_to_prob(m["price"]) for m in ml if m.get("price")}
-    if len(implied) != 2:
-        return {}
-    need = (int(odds.get("num_periods") or 3) + 1) // 2  # maps needed to win the series
+def map_win_prob(series_p):
+    """The market's chance that a team wins a map, from its chance to win the series (team_ml_percent), so it
+    means what the model's Elo win_prob means; NaN when missing. Maps taken as independent, so a series win is
+    p^2 (3 - 2p).
+    ponytail: every series taken as best of 3 (props don't say); a best of 5 would come out a little too lopsided."""
+    if not 0 < (series_p or 0) < 1:
+        return np.nan
     p = np.linspace(0, 1, 1001)
-    series = sum(comb(need - 1 + j, j) * p ** need * (1 - p) ** j for j in range(need))
-    total = sum(implied.values())
-    return {team: float(np.interp(prob / total, series, p)) for team, prob in implied.items()}
-
-
-def market_win_prob(page, item, cache):
-    """The market's chance that a props item's team wins a map (NaN if unknown). page(path, **params) fetches a
-    website route; cache maps fixture id -> map_win_probs, so each match's odds are fetched once."""
-    for fixture in dict.fromkeys(FIXTURE.findall(json.dumps(item))):  # usually one; the first with odds wins
-        if fixture not in cache:
-            try:
-                cache[fixture] = map_win_probs(page(f"/api/cs2/matches/{fixture}/odds", map=1))
-            except Exception as e:  # one match's odds must not lose the lines
-                print(f"odds for match {fixture}: FAILED {e!r}", file=sys.stderr)
-                cache[fixture] = {}
-        if cache[fixture]:
-            team, opp = (team_key((item.get(k) or {}).get("name")) for k in ("team", "opponent"))
-            return cache[fixture].get(team, np.nan) if opp in cache[fixture] else np.nan  # else sides could swap
-    return np.nan
+    return float(np.interp(series_p, p * p * (3 - 2 * p), p))
 
 
 def series_results(games):
@@ -180,7 +155,7 @@ def player_rows(it, games, history, since):
                     rows.append(dict(book=book, player=it["player_name"], team=r["team"], opponent=r["vs"],
                                      stat=MARKETS[display], maps="1-2", line=book_line(app, h["line"]),
                                      over_odds=prices[0], under_odds=prices[1], start_time=r["start"].isoformat(),
-                                     actual=r[MARKETS[display]]))
+                                     actual=r[MARKETS[display]], market_win_prob=map_win_prob(h.get("team_ml_percent"))))
     return rows
 
 
@@ -205,6 +180,9 @@ def history(months=6):
                   f"{len(new)} rows with results")
     key = ["book", "player", "stat", "start_time", "line"]
     df = pd.DataFrame(rows, columns=COLS + ["actual"]).drop_duplicates(key)
+    print(f"market win chance on {df.market_win_prob.notna().sum()} of {len(df)} past lines"
+          + ("" if df.market_win_prob.notna().any() or df.empty else ": its entries lack team_ml_percent, so run "
+             "discover, open Prop History and send the call_*.json holding its entries"))
     if os.path.exists(PROPS_CSV):  # keep earlier runs' lines (other players, older dates); new rows win
         df = pd.concat([df, pd.read_csv(PROPS_CSV)]).drop_duplicates(key)
     df.to_csv(PROPS_CSV, index=False)

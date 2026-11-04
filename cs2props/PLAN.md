@@ -76,7 +76,9 @@ something it can't use live.
 
 Why our own Elo instead of the sportsbook moneyline: there is no history of pre-match odds (bo3.gg only
 keeps the last, post-result price), so a book price can't be a training feature. Elo is computed the same
-way in training and live.
+way in training and live. At prediction time, though, the market's win chance (PickFinder's props list,
+section 4) replaces the Elo's `win_prob` where a line has it: the model then reacts to the market's view of
+the matchup with the response it learned for Elo.
 
 ## 3. Model
 
@@ -183,7 +185,7 @@ All verified live on 2026-10-30, no login or browser needed:
 | Underdog | `api.underdogfantasy.com/v1/over_under_lines?sport_id=CS` | Standard pick'em payout, so the same default breakeven as PrizePicks. The feed's `-112` tag is not what a pick'em entry pays |
 | Sleeper | `api.sleeper.app/lines/available` + `/players/cs` + `/scores/lines_game_picker` | Payout multipliers converted to American odds (1.78 → -128, as in the screenshot) |
 | PickFinder (optional) | `api-v2.pickfinder.app/props?sport=cs2` with the logged-in `__session` token | Replaces the screenshot + OCR. Adds DraftKings Pick6, Dabble, ParlayPlay, ThunderPick, and others. **Untested**, needs your login |
-| PickFinder match odds (with `--pickfinder`) | `www.pickfinder.app/api/cs2/matches/{fixture}/odds?map=1`, from inside the logged-in page | The market's win chance: Thunderpick's series moneyline, vig removed, turned into the chance to win a map (best of 3 or 5, maps independent) so it means what the Elo `win_prob` means. Every book's line of that matchup gets it as `market_win_prob`, and the model uses it in place of the Elo's. The fixture id is found in each props item by its format (e.g. `202611045E87085E`), since that response hasn't been inspected: `lines` prints how many lines got odds |
+| The market's win chance (with `--pickfinder`) | Each PickFinder props item's `team_ml_percent`: Thunderpick's series moneyline with the vig removed (e.g. Legacy -200 / B8 +140 is 0.6154 / 0.3846) | Turned into the chance to win a map (best of 3, maps independent) so it means what the Elo `win_prob` means. Every book's line of that matchup gets it as `market_win_prob`, and the model uses it in place of the Elo's. `lines` prints how many lines got one |
 
 Every scrape is appended to `data/lines_history.csv`.
 
@@ -294,13 +296,12 @@ request, but check PickFinder's terms before running it often.
 
 Next steps, in order of value:
 
-- **The market's win chance on past lines.** Current lines get it from the match odds (section 4), and our own
-  archive keeps it from now on, so a backtest on `data/lines_history.csv` reports whether it beat the Elo
-  ("Market win chance on N graded lines: projection error ..."). The 3,210 PickFinder lines lack it: the
-  Prop History response carries both teams' implied win chances, but its field names weren't captured
-  (`call_00`/`call_01` of a `discover` run with Prop History open). With them, `pickfinder history` can
-  keep it. On bo3.gg, a 20-point drop in win chance moves the projection by -0.38 kills on average (up to
-  -1.8); a rise barely moves it, as blowouts hurt the loser.
+- **Check the market's win chance on past lines.** Current lines get it from the props list (section 4) and
+  our archive keeps it, and `pickfinder history` now reads it from the Prop History entries as
+  `team_ml_percent`. That is the props list's name for it and is unverified for history entries, so the run
+  prints how many past lines had it. A backtest then reports whether it beat our Elo ("Market win chance on
+  N graded lines: projection error ..."). On bo3.gg, a 20-point drop in win chance moves the projection by
+  -0.38 kills on average (up to -1.8); a rise barely moves it, as blowouts hurt the loser.
 - **A classifier trained on real lines**, beyond the two-number calibration, once there are several
   thousand graded lines: `(features, line) → over?`.
 
