@@ -93,6 +93,8 @@ way in training and live.
 - **Tuning:** loss (squared error or Poisson, which suits counts), learning rate 0.05 or 0.1, and 15 or
   31 leaves per tree, chosen on a validation slice by MAE. Both stats chose Poisson, 0.05 and 15.
 - **Split by time:** oldest 70% train, next 15% validate (tuning and the error spread), newest 15% test.
+  The saved model is then refit on all of it, so it has seen the latest matches (it used to leave out the
+  newest 15%, which made every model a few months stale).
 - **What `train` prints:** test MAE of the model versus the naive "2 × 20-map average", a stand-in-line
   hit rate (optimistic, since real books are sharper than a 20-map average), Brier score versus a coin
   flip, and the top features (how much the test error rises when each feature is shuffled).
@@ -185,8 +187,10 @@ are two sources:
 - **Matching:** each line is first matched to its own bo3.gg series: same player, same opponent, starting
   within 90 minutes. Book and bo3.gg times differ by minutes, while same-day rematches are 2+ hours apart.
   Lines whose series isn't in bo3.gg are not graded rather than graded against the wrong match.
-- **No look-ahead:**
-  - The trees are refit on matches *before* the first graded line.
+- **No look-ahead, walk-forward:**
+  - Each calendar month's lines are scored by trees refit on every match before that month began
+    (settings tuned once, on the first month), like a regular `train` would. A single model fitted before
+    the first line was up to three months stale by the last one.
   - Features are taken strictly before the *earlier* of the book's and bo3.gg's start time. Books and
     PickFinder often list a start a few minutes after bo3.gg does, and using the later time let the graded
     match into its own features (a test now checks this).
@@ -200,7 +204,16 @@ are two sources:
   - all of that split by edge bucket, stat, OVER/UNDER and book
   - "always over / always under" baselines
   - a calibration table (predicted P(over) vs actual)
-- **Per-line results** go to `data/backtest.csv`.
+  - line shopping: where two books post different lines on one series, how often the side the gap favours
+    wins (over at the lower line, under at the higher), with no model at all
+- **Calibrated against the books.** The model never sees the line, so it is overconfident whenever it
+  disagrees with it (in the first real backtest the 10%+ edge bets hit 48%, worse than the 0-5% ones). The
+  backtest fits `P(over) = sigmoid(a + b × logit(model P(over)))` per stat on graded lines, walk-forward (a
+  month is calibrated only on earlier months), and reports the calibrated picks next to the raw ones.
+  `b` is how much of the model's disagreement with the line is real (1 all of it, 0 none) and `a` is its
+  lean to one side: watch `b` when changing features. The fit on all graded lines is saved to
+  `data/calibration.joblib`, and `predict` uses it while the feature list is unchanged.
+- **Per-line results** go to `data/backtest.csv` (raw and `_cal` columns).
 
 Only trust the picks if the hit rate beats breakeven by more than the band. At 500 bets the band is
 about ±4.5 points, so a 58% hit rate at a 54.3% breakeven is not yet proof.
@@ -240,10 +253,11 @@ request, but check PickFinder's terms before running it often.
 
 Next steps, in order of value:
 
-- **A classifier trained on real lines.** Once a few thousand graded lines exist, train it on
-  `(features, line) → over?`.
-- **Monthly walk-forward refits in the backtest.** It trains once, before the first graded line, so later
-  lines use a model that is months old. The calibration drift above is the symptom.
+- **The market's win probability.** PickFinder's prop history carries both teams' implied win chances, but
+  `pickfinder.py` drops them. Kept, they are a far sharper win chance than our ratings, usable in the
+  calibration (as `market − model` win probability) and at predict time.
+- **A classifier trained on real lines**, beyond the two-number calibration, once there are several
+  thousand graded lines: `(features, line) → over?`.
 
 ## 7. Known limitations
 

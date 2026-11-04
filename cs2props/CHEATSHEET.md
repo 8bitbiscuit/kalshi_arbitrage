@@ -58,6 +58,11 @@ after the file to test the single tree.
 python -m cs2props.model backtest
 ```
 
+The backtest refits the model each month, then prints two reports: the raw model, and the model
+calibrated against the books on earlier months' lines. It also saves that calibration to
+`data/calibration.joblib`, and `predict` uses it from then on. Re-run the backtest after changing the
+model's features, because `predict` ignores a calibration made for a different feature list.
+
 If `history` finds no past lines, record what a player page loads. Open Prop History in the Firefox
 window, wait for its cards, then press Enter in the terminal. The responses go to `data/pickfinder_debug/`.
 
@@ -102,3 +107,4 @@ At the top of `cs2props/model.py`:
 | `picks.csv` | `predict` | Projections, probabilities, edges and picks |
 | `prop_history.csv` | `pickfinder history` | PickFinder past lines with results |
 | `backtest.csv` | `backtest` | Per-line backtest results |
+| `calibration.joblib` | `backtest` | P(over) calibration against real lines, used by `predict` |
