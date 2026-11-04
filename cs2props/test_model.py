@@ -1,4 +1,5 @@
 """python -m pytest cs2props -q"""
+import joblib
 import numpy as np
 import pandas as pd
 
@@ -7,8 +8,8 @@ from cs2props import lines, model
 TEAMS = ["Alpha Gaming", "Bravo", "Charlie", "Delta"]
 
 
-def fake_maps(n_matches=400, seed=0):
-    """BO3s between 4 teams of 5. Alpha (team 0) is much stronger; player 0 'maxoff' gets more kills."""
+def fake_maps(n_matches=400, seed=0, hours=1):
+    """BO3s between 4 teams of 5, `hours` apart. Alpha (team 0) is much stronger; player 0 'maxoff' gets more kills."""
     rng = np.random.default_rng(seed)
     rows, game = [], 0
     for m in range(n_matches):
@@ -20,7 +21,7 @@ def fake_maps(n_matches=400, seed=0):
                 for k in range(5):
                     pid = t * 5 + k
                     kills = int(rng.poisson(20 if pid == 0 else 15))
-                    rows.append(dict(match_id=m, start_date=pd.Timestamp("2025-01-01", tz="UTC") + pd.Timedelta(hours=m),
+                    rows.append(dict(match_id=m, start_date=pd.Timestamp("2025-01-01", tz="UTC") + pd.Timedelta(hours=m * hours),
                                      tier="b", bo_type=3, game_id=game, map_number=num, map_name=mp, rounds=22,
                                      team_id=t, team_name=TEAMS[t], opp_id=o, player_id=pid,
                                      nickname="max" if pid == 0 else f"p{pid}", win=int(won), kills=kills,
@@ -32,6 +33,7 @@ def test_features_never_see_the_match_being_predicted():
     df = fake_maps(60)
     a = model.features(model.series(df), df)
     df.loc[df.match_id == 59, ["kills", "headshots"]] += 100
+    df.loc[df.match_id == 59, "win"] = 1 - df.win  # results move Elo, which sched_gap uses
     b = model.features(model.series(df), df)
     cols = ["match_id", "player_id"] + model.FEATURES
     pd.testing.assert_frame_equal(a[a.match_id == 59][cols], b[b.match_id == 59][cols])
@@ -95,29 +97,51 @@ def test_train_then_predict(tmp_path, monkeypatch):
 
 def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(model, "MIN_CAL_LINES", 20)
     (tmp_path / "data").mkdir()
-    df = fake_maps(400)
+    df = fake_maps(400, hours=6)  # graded lines span March and April: two monthly refits, April calibrated on March
     df.to_csv("data/maps.csv", index=False)
     s = model.series(df)
     late = s[(s.match_id >= 300) & s.player_id.isin([0, 7])]  # 'max' averages ~40, 'p7' ~30
     names = dict(enumerate(TEAMS))
 
     def run(shift):  # the book lists the match `shift` away from bo3.gg's start time
-        pd.DataFrame(dict(book="pf", player=late.player_id.map({0: "max", 7: "p7"}), team=late.team_id.map(names),
-                          opponent=late.opp_id.map(names), stat="kills", maps="1-2",
-                          line=late.player_id.map({0: 30.5, 7: 36.5}), over_odds=-115, under_odds=-115,
-                          start_time=(late.start_date + shift).dt.strftime("%Y-%m-%dT%H:%M:%SZ"), actual=late.kills_m12)
-                     ).to_csv("data/prop_history.csv", index=False)
+        pf = pd.DataFrame(dict(book="pf", player=late.player_id.map({0: "max", 7: "p7"}), team=late.team_id.map(names),
+                               opponent=late.opp_id.map(names), stat="kills", maps="1-2",
+                               line=late.player_id.map({0: 30.5, 7: 36.5}), over_odds=-115, under_odds=-115,
+                               start_time=(late.start_date + shift).dt.strftime("%Y-%m-%dT%H:%M:%SZ"), actual=late.kills_m12))
+        pp = pf[pf.player == "max"].assign(book="pp", line=31.5)  # a second book a kill higher on max
+        pd.concat([pf, pp]).to_csv("data/prop_history.csv", index=False)
         model.backtest()
         return pd.read_csv("data/backtest.csv").sort_values(["player", "match_start"]).reset_index(drop=True)
 
     early, bt = run(pd.Timedelta(minutes=-5)), run(pd.Timedelta(minutes=5))
-    assert "agrees with bo3.gg on 100.0%" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "agrees with bo3.gg on 100.0%" in out and "Calibrated on earlier months' lines" in out
+    assert "Line shopping (untimed lines)" in out and "disagree by 1.0 on average" in out
     pd.testing.assert_series_equal(early.proj, bt.proj)  # listing the match late must not leak its result
     assert len(bt) >= 0.95 * len(late)  # a few series fail load()'s sanity checks and are not graded
     assert (bt[bt.player == "max"].pick == "OVER").mean() > 0.9
     assert (bt[bt.player == "p7"].pick == "UNDER").mean() > 0.9
     assert bt.units.sum() > 0
+    april = bt.month == "2025-04"
+    assert bt.pick_cal[~april].isna().all() and (bt.pick_cal[april] == bt.pick[april]).mean() > 0.9
+    saved = joblib.load(model.CAL_JOBLIB)
+    assert saved["kind"] == "gbm" and saved["lines"]["kills"] > 100 and set(saved["cal"]) == {"kills"}
+    monkeypatch.setattr(model, "MIN_CAL_LINES", 10_000)  # too few lines now: the saved calibration must survive
+    run(pd.Timedelta(minutes=5))
+    assert "Calibration not saved" in capsys.readouterr().out and joblib.load(model.CAL_JOBLIB)["lines"] == saved["lines"]
+
+
+def test_calibration_shrinks_an_overconfident_model():
+    rng = np.random.default_rng(0)
+    p = rng.uniform(0.2, 0.8, 6000)  # the model's P(over); the truth leans over and moves 40% as much
+    over = rng.random(6000) < 0.54 + 0.4 * (p - 0.5)
+    g = pd.DataFrame(dict(p_over=p, p_under=1 - p, stat="kills", result=np.where(over, "OVER", "UNDER")))
+    cal = model.fit_calibration(g)
+    assert set(cal) == {"kills"} and 0.25 < cal["kills"].coef_[0, 0] < 0.6  # slope in logit units: ~0.4
+    c = model.calibrated(g.copy(), cal)
+    assert abs(c.p_over.mean() - over.mean()) < 0.01 and c.p_over.std() < 0.5 * p.std()
 
 
 def test_pickfinder_history_rows():
