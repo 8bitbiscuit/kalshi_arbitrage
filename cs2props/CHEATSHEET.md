@@ -56,7 +56,8 @@ python -m cs2props.pickfinder history
 Grade the model on those lines. Add `data/lines_history.csv` to use your own archive instead, and `tree`
 after the file to test the single tree. With 300+ player-series from 30+ matches it also learns a
 calibrator from them (`data/calibrator.joblib`). It is saved only if it beats the raw model on later
-matches, and `predict` then uses it.
+matches, and `predict` then uses it. The output ends with a summary of the calibrated model's backtested hit
+rate, each month scored by a calibrator learned only from earlier months.
 
 ```bash
 python -m cs2props.model backtest
@@ -97,7 +98,8 @@ At the top of `cs2props/model.py`:
 - `HALF_LIFE_DAYS` (default 90) makes recent matches count more in training: a match that many days older
   than the newest counts half. `None` weights every match equally. Retrain after changing it.
 - `MISS_DAYS` (30) and `MISS_MIN` (50) set the kills correction: the average miss of real kills lines over
-  the last 30 days, used once 50 player-series exist. Re-run `backtest` after changing them.
+  the last 30 days, used once 50 player-series exist. `PLAYER_DAYS` (90) is how far back each player's own
+  lines go when refining it per player. Re-run `backtest` after changing them.
 
 ## Files in `data/`
 

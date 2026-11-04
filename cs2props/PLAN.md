@@ -115,7 +115,14 @@ decider). bo3.gg's own pick/ban records stopped in mid-September 2026.
   gets the average (actual − projection) of real kills lines from the last 30 days added (`MISS_DAYS`),
   once at least 50 player-series exist (`MISS_MIN`). The backtest measures this walk-forward: each line
   only uses results from matches at least a day before it. It then saves the latest 30 days' figure to
-  `data/kills_miss.json` for `predict`. Every backtest rewrites that file (0 when there are too few series)
+  `data/kills_miss.json` for `predict`.
+- **Refined per player:** each player's own kills misses over the last 90 days (`PLAYER_DAYS`) refine the
+  global figure: (their summed misses + K × global) / (their series + K). K is estimated from the data as
+  the noise in one series' miss divided by how much players' true average misses differ. When players
+  don't differ beyond noise, K is infinite and everyone gets the global figure. A player's handful of lines
+  is mostly noise (one series' kills miss varies by about ±6), so this keeps them from swinging projections.
+  On stand-in lines K was 195 series, so per-player corrections stayed close to the global one.
+  Every backtest rewrites that file (0 when there are too few series)
   and the calibrator records the same figure, so `predict` never pairs a calibrator with a correction from
   another run. Headshots are not corrected, because the recency weights already remove their bias.
 - **Calibrated on real lines:** the model alone was far too confident against real books (see section 6),
@@ -238,17 +245,24 @@ are two sources:
   - units won and ROI at each line's own price
   - all of that split by edge bucket, stat, OVER/UNDER and book
   - "always over / always under" baselines
-  - a calibration table (predicted P(over) vs actual)
+  - a calibration table: lines grouped by the model's P(over) (0-30%, 30-40%, ... 70-100%), with each
+    group's average prediction next to how often its lines actually went over. Well calibrated means the
+    two columns match
   - the share of lines that had a market win probability
-- **Kills correction:** it prints kills bets before and after the average-miss correction, including the
-  share of OVER picks, and saves the latest correction for `predict`. On stand-in lines the OVER share of
-  kills picks went from 33% to 48%.
+- **Kills correction:** it prints kills bets with no correction, the global average miss, and refined per
+  player (all walk-forward), including the share of OVER picks and the projections' error and bias, and
+  saves the latest correction for `predict`. On stand-in lines both corrections took the OVER share of kills
+  picks from 33% to 48% but did not reduce projection error.
 - **Calibrator:** with 300+ player-series from 30+ matches it then fits the calibrator on earlier matches,
   prints raw vs calibrated results on later ones (overall, by edge, calibration table, log loss), and
   saves it for `predict` only if its log loss is lower. Otherwise the existing file is left alone. A
   `tree` backtest never saves one. On a one-day archive of 307 lines (154 series) the first version saved a
   calibrator that cut the later hit rate from 51.6% to 39.6%; these rules stop that. The calibrator is fitted
   on corrected kills projections, so `predict` ignores one saved before the correction existed.
+- **Summary at the end:** the calibrated model over the whole backtest, each month scored by a calibrator
+  learned only from earlier months (the first month has no earlier lines, so it is left out), next to the
+  uncalibrated model on the same lines, plus the calibrated results by stat. The saved calibrator is refit
+  on all lines, so scoring the backtest with it would be optimistic; this summary is the honest figure.
 - **Per-line results** go to `data/backtest.csv`.
 
 Only trust the picks if the hit rate beats breakeven by more than the band. At 500 bets the band is

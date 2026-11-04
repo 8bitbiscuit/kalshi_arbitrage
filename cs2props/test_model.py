@@ -137,7 +137,7 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
     early, bt = run(pd.Timedelta(minutes=-5)), run(pd.Timedelta(minutes=5))
     printed = capsys.readouterr().out
     assert "agrees with bo3.gg on 100.0%" in printed and "log loss" in printed
-    assert "average-miss correction" in printed and "Saved data/kills_miss.json" in printed
+    assert "refined per player" in printed and "Saved data/kills_miss.json" in printed
     saved = "Saved data/calibrator.joblib" in printed
     assert saved or "did not beat the raw model" in printed  # saved only when it wins on later matches
     pd.testing.assert_series_equal(early.proj, bt.proj)  # listing the match late must not leak its result
@@ -150,7 +150,7 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
                        line=30.5, start_time="2026-01-01T00:00:00Z")]).to_csv("data/lines.csv", index=False)
     model.predict()
     printed = capsys.readouterr().out
-    assert ("calibrated on" in printed) == saved and "Kills projections are corrected by" in printed
+    assert ("calibrated on" in printed) == saved and "Kills projections: global correction" in printed
 
 
 def test_pickfinder_history_rows():
@@ -248,3 +248,33 @@ def test_recency_weights_and_walk_forward_kills_miss():
     # Only results from at least a day before count: a line's own match never corrects itself.
     out.loc[out.match_start == days[30], "actual"] = 99.0
     assert np.allclose(model.recent_miss(out)[day30.to_numpy()], 2.0)
+
+
+def test_per_player_kills_correction_and_monthly_calibrated_summary():
+    rng = np.random.default_rng(1)
+    # Players whose misses differ only by noise -> no per-player correction; real differences -> finite prior.
+    same = pd.DataFrame(dict(player_id=np.repeat(np.arange(40), 10), miss=rng.normal(0, 6, 400)))
+    differ = same.assign(miss=same.miss / 6 + np.repeat(rng.normal(0, 3, 40), 10))
+    assert model.prior_strength(same) > 50 and model.prior_strength(differ) < 1
+
+    # Saved correction: player 7 has 10 recent series summing to +30 kills of miss.
+    saved = {"kills_miss": 0.5, "prior": 10.0, "players": {"7": [30.0, 10]}}
+    assert np.allclose(model.saved_corrections(pd.Series([7.0, 8.0, np.nan]), saved), [1.75, 0.5, 0.5])
+    assert np.allclose(model.saved_corrections(pd.Series([7.0]), {**saved, "prior": None}), [0.5])
+
+    # Walk-forward: player 0 always beats his projection by 5, the other 59 by 0; 3 months of daily series.
+    days = pd.date_range("2026-01-01", "2026-03-31", freq="D", tz="UTC")
+    rows = [dict(stat="kills", player_id=float(p), team_id=p % 6, opp_id=(p + 1) % 6, match_start=t, line=27.5,
+                 actual=30.0 + (5 if p == 0 else 0) + rng.normal(0, 1), proj=30.0, p_over=0.55, p_under=0.45,
+                 over_odds=-110, under_odds=-110) for t in days for p in range(60)]
+    out = pd.DataFrame(rows)
+    out["result"] = np.where(out.actual > out.line, "OVER", "UNDER")
+    glob, per_player = model.walk_forward_kills(out)
+    late = (out.match_start > "2026-03-01").to_numpy()
+    p0 = (out.player_id == 0).to_numpy()
+    assert per_player[late & p0].mean() > 3 > glob[late & p0].mean()          # player 0's own misses count
+    assert abs(per_player[late & ~p0].mean() - glob[late & ~p0].mean()) < 0.2  # others stay near the global
+    assert (per_player[(out.match_start == days[0]).to_numpy()] == 0).all()   # nothing earlier yet
+
+    wf = model.walk_forward_calibrated(out)  # January has no earlier months, so it is left out
+    assert len(wf) and wf.match_start.min() >= pd.Timestamp("2026-02-01", tz="UTC")
