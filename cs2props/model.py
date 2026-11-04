@@ -315,6 +315,9 @@ def score(lines, df, bundles, cal=None):
     known = lines[lines.player_id.notna() & (lines.opp_id != -1)].astype({"player_id": int, "team_id": int, "opp_id": int})
     f = features(known[["line_idx", "player_id", "team_id", "opp_id", "start_date"]], df)
     out = lines.merge(f[["line_idx"] + FEATURES], on="line_idx", how="left")
+    if "market_win_prob" in out:  # the market's win chance (lines.py --pickfinder) is sharper than our Elo's
+        out["elo_win_prob"] = out.win_prob
+        out["win_prob"] = pd.to_numeric(out.market_win_prob, errors="coerce").fillna(out.win_prob)
     out["proj"] = out["p_over"] = out["p_under"] = np.nan
     for stat, bundle in bundles.items():
         m = (out.stat == stat) & out[NEED[stat]].notna().all(axis=1)
@@ -337,7 +340,8 @@ def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
     same = (saved.get("features"), saved.get("kind")) == (FEATURES, bundles["kills"]["metrics"]["model"])
     cal = saved.get("cal") if same else None
     out = score(pd.read_csv(lines_csv), df, bundles, cal).sort_values("edge", ascending=False)
-    cols = ["book", "player", "matched", "team", "opponent", "stat", "line", "proj", "p_over", "p_under", "edge", "pick"]
+    cols = ["book", "player", "matched", "team", "opponent", "stat", "line", "proj", "elo_win_prob", "market_win_prob",
+            "p_over", "p_under", "edge", "pick"]
     out.to_csv(PICKS_CSV, index=False)
     print(out[[c for c in cols if c in out]].round(3).to_string(index=False))
     print(f"\n{(out.pick == 'NO DATA').sum()} of {len(out)} lines had no usable history (check 'matched').")
@@ -430,7 +434,11 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     for month, chunk in props.groupby("month"):
         bundles = fit_models(feats[feats.start_date < known(month)], kind, verbose=False, params=params)
         params = {stat: b["params"] for stat, b in bundles.items()}
-        parts.append(score(chunk.drop(columns=["start_date", "player_id", "team_id", "opp_id", "matched"]), df, bundles))
+        lines = chunk.drop(columns=["start_date", "player_id", "team_id", "opp_id", "matched"])
+        part = score(lines, df, bundles)
+        if "market_win_prob" in lines and lines.market_win_prob.notna().any():  # the same lines on our Elo alone
+            part["proj_elo"] = score(lines.drop(columns="market_win_prob"), df, bundles).proj.to_numpy()
+        parts.append(part)
     out = pd.concat(parts, ignore_index=True)
 
     bo3 = pd.Series(np.where(out.stat == "kills", out.kills_m12, out.headshots_m12), index=out.index)
@@ -448,6 +456,12 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     bet = report(out, f"{kind} model, refit monthly")
     over_rate = (out.result == "OVER")[out.result != "PUSH"].mean()
     print(f"\nBaselines: always OVER hits {over_rate:.1%}, always UNDER hits {1 - over_rate:.1%}")
+    if "proj_elo" in out:  # did the market's win chance make projections better than our Elo's?
+        mk = out.proj_elo.notna() & out.market_win_prob.notna()
+        err = lambda p: (out.actual - p)[mk]  # noqa: E731
+        print(f"Market win chance on {mk.sum()} graded lines: projection error {err(out.proj).abs().mean():.2f} "
+              f"(bias {err(out.proj).mean():+.2f}) vs {err(out.proj_elo).abs().mean():.2f} "
+              f"(bias {err(out.proj_elo).mean():+.2f}) with our Elo's")
     # Line shopping, no model: where books post different lines on one series, take the side the gap favours.
     # Our archive's lines are compared within one scrape only (a pulled line next to another book's later,
     # moved one was never on offer). PickFinder's lines carry no time, so there the books may not overlap.

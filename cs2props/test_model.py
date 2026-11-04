@@ -77,7 +77,7 @@ def test_train_then_predict(tmp_path, monkeypatch):
     when = "2026-01-01T00:00:00Z"
     pd.DataFrame([  # the book calls player 'max' "MaxOff" and the team "Team Alpha Esports"
         dict(book="a", player="MaxOff", team="Team Alpha Esports", opponent="Delta", stat="kills", maps="1-2",
-             line=30.5, start_time=when),
+             line=30.5, start_time=when, market_win_prob=0.3),
         dict(book="b", player="maxoff", team="Alpha", opponent="Delta", stat="headshots", maps="1-2",
              line=25.5, over_odds=-112, under_odds=-112, start_time=when),
         dict(book="a", player="p7", team="Bravo", opponent="Charlie", stat="kills", maps="1-3", line=45.5, start_time=when),
@@ -88,6 +88,7 @@ def test_train_then_predict(tmp_path, monkeypatch):
     model.predict()
     picks = pd.read_csv("data/picks.csv").set_index(["player", "stat"])
     assert picks.loc[("MaxOff", "kills"), "matched"] == "max"
+    assert picks.loc[("MaxOff", "kills"), "win_prob"] == 0.3 and picks.loc[("MaxOff", "kills"), "elo_win_prob"] > 0.7
     assert picks.loc[("MaxOff", "kills"), "pick"] == "OVER"         # ~40 expected vs 30.5
     assert picks.loc[("maxoff", "headshots"), "pick"] == "UNDER"    # ~20 expected vs 25.5
     assert picks.loc[("nobody", "kills"), "pick"] == "NO DATA"
@@ -178,3 +179,52 @@ def test_pickfinder_history_rows():
         ("prizepicks", "DENDELE CS", 28.5, 30, -119), ("underdog", "DENDELE CS", 26.5, 30, -115),
         ("underdog", "PARIVISION", 26.5, 20, -110)]
     assert rows[0]["start_time"].startswith("2025-10-26T16:34") and rows[0]["team"] == "G2"
+
+
+# Trimmed from a real PickFinder response: /api/cs2/matches/202611045E87085E/odds?map=1, G2 vs Aurora, 7 h before it.
+ODDS = {"id": "202611045E87085E", "num_periods": 3, "home_team_id": "BE26425B2116", "away_team_id": "E0C50B15FE2E",
+        "teams": {"BE26425B2116": {"moneyline": {"market_id": "moneyline", "name": "G2", "price": 115}},
+                  "E0C50B15FE2E": {"moneyline": {"market_id": "moneyline", "name": "Aurora Gaming", "price": -161}}}}
+
+
+def test_market_win_prob_from_match_odds():
+    from cs2props import pickfinder
+    g2 = pickfinder.map_win_probs(ODDS)["g2"]  # series 43.0% after the vig -> 45.3% a map, best of 3
+    assert abs(g2 - 0.453) < 0.002 and abs(g2 + pickfinder.map_win_probs(ODDS)["aurora"] - 1) < 1e-3
+    assert pickfinder.map_win_probs({**ODDS, "num_periods": 5})["g2"] > g2  # a best of 5 stretches gaps further
+
+    calls, cache = [], {}
+
+    def page(path, **params):
+        calls.append(path)
+        return ODDS
+
+    item = dict(player_name="huNter-", game=dict(id="202611045E87085E"), team=dict(name="G2 Esports"),
+                opponent=dict(name="Aurora"))
+    assert abs(pickfinder.market_win_prob(page, item, cache) - g2) < 1e-9
+    assert abs(pickfinder.market_win_prob(page, {**item, "team": dict(name="Aurora"), "opponent": dict(name="G2")},
+                                          cache) - (1 - g2)) < 1e-3
+    assert calls == ["/api/cs2/matches/202611045E87085E/odds"]  # one request per match
+    assert np.isnan(pickfinder.market_win_prob(page, {**item, "opponent": dict(name="Vitality")}, cache))  # no guess
+    assert np.isnan(pickfinder.market_win_prob(page, dict(team=dict(name="G2")), cache))  # no fixture id
+
+
+def test_lines_market_and_history(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    # an archive written before market_win_prob existed must keep its rows
+    pd.DataFrame([dict(book="sleeper", player="old", team="X", opponent="Y", stat="kills", maps="1-2", line=20.5,
+                       over_odds=-110, under_odds=-110, start_time="2026-10-01T10:00:00Z",
+                       scraped_at="2026-10-01T09:00:00Z")]).to_csv(lines.HISTORY_CSV, index=False)
+    row = dict(stat="kills", maps="1-2", line=30.5, start_time="2026-11-03T02:00:00Z")
+    monkeypatch.setattr(lines, "prizepicks", lambda: [dict(book="prizepicks", player="huNter-", team="G2",
+                                                           opponent="Aurora", **row)])
+    monkeypatch.setattr(lines, "underdog", lambda: [dict(book="underdog", player="woxic", team="Aurora Gaming",
+                                                         opponent="G2 Esports", **row)])
+    monkeypatch.setattr(lines, "sleeper", lambda: [])
+    monkeypatch.setattr(lines, "pickfinder", lambda: lines.MARKET.update({"g2|aurora": 0.45}) or [])
+    monkeypatch.setattr(lines.sys, "argv", ["lines", "--pickfinder"])
+    lines.main()
+    hist = pd.read_csv(lines.HISTORY_CSV)
+    assert list(hist.player) == ["old", "huNter-", "woxic"] and hist.market_win_prob.isna().tolist() == [True, False, False]
+    assert pd.read_csv(lines.LINES_CSV).market_win_prob.round(2).tolist() == [0.45, 0.55]  # opponent's side: 1 - p

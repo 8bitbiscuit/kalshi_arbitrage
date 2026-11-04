@@ -2,6 +2,7 @@
 
     python -m cs2props.lines               # PrizePicks + Underdog + Sleeper public JSON feeds, no login
     python -m cs2props.lines --pickfinder  # also every book PickFinder tracks (DraftKings Pick6, Dabble, ...)
+                                           # and the market's win chance for each match, from its odds
 
 --pickfinder logs in with Selenium using the PICKFINDER_EMAIL and PICKFINDER_PASSWORD environment
 variables, then reads PickFinder's own JSON API with the session token instead of screenshots + OCR.
@@ -14,8 +15,12 @@ import time
 import pandas as pd
 import requests
 
+from cs2props.model import team_key
+
 LINES_CSV, HISTORY_CSV = "data/lines.csv", "data/lines_history.csv"
-COLS = ["book", "player", "team", "opponent", "stat", "maps", "line", "over_odds", "under_odds", "start_time"]
+COLS = ["book", "player", "team", "opponent", "stat", "maps", "line", "over_odds", "under_odds", "start_time",
+        "market_win_prob"]
+MARKET = {}  # "team|opponent" (model.team_key) -> the market's per-map win chance, filled by pickfinder()
 http = requests.Session()
 http.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
                                    "Chrome/130.0 Safari/537.36", "Accept": "application/json"})
@@ -94,12 +99,17 @@ def sleeper():
 
 
 def pickfinder():
-    from cs2props.pickfinder import current_props, main_prices, session  # Selenium login; see pickfinder.py
+    from cs2props.pickfinder import current_props, main_prices, market_win_prob, session  # Selenium; see pickfinder.py
 
     with session() as get:
+        odds = {}  # fixture id -> win chances: one odds request per match
         for it in current_props(get):
             if it.get("isAltLine"):
                 continue
+            team, opp = (team_key((it.get(k) or {}).get("name")) for k in ("team", "opponent"))
+            win = market_win_prob(get.page, it, odds)
+            if win == win:  # not NaN
+                MARKET[f"{team}|{opp}"] = win
             for book, app in (it.get("apps") or {}).items():
                 prices = main_prices(app)  # skips goblin/demon/boosted and one-sided lines
                 if book in ("prizepicks", "underdog", "sleeper") or not prices:  # those three are fetched directly
@@ -111,6 +121,7 @@ def pickfinder():
 
 def main():
     rows = []
+    MARKET.clear()
     for src in [prizepicks, underdog, sleeper] + ([pickfinder] if "--pickfinder" in sys.argv else []):
         try:
             got = list(src())
@@ -121,11 +132,26 @@ def main():
         rows += got
     df = pd.DataFrame(rows, columns=COLS)
     df["start_time"] = pd.to_datetime(df.start_time, utc=True, format="ISO8601")
+    df["market_win_prob"] = market_lookup(df.team, df.opponent)
+    if "--pickfinder" in sys.argv:
+        print(f"market win chance for {df.market_win_prob.notna().sum()} of {len(df)} lines")
     os.makedirs("data", exist_ok=True)
     df.to_csv(LINES_CSV, index=False)
-    df.assign(scraped_at=pd.Timestamp.now(tz="UTC")).to_csv(
-        HISTORY_CSV, mode="a", header=not os.path.exists(HISTORY_CSV), index=False)
+    hist = df.assign(scraped_at=pd.Timestamp.now(tz="UTC"))
+    if os.path.exists(HISTORY_CSV):  # rewritten whole, as an older file can lack newer columns; temp file, then swap
+        hist = pd.concat([pd.read_csv(HISTORY_CSV), hist], ignore_index=True)
+    hist.to_csv(HISTORY_CSV + ".tmp", index=False)
+    os.replace(HISTORY_CSV + ".tmp", HISTORY_CSV)
     print(f"wrote {len(df)} lines to {LINES_CSV}")
+
+
+def market_lookup(team, opponent):
+    """The market's per-map win chance for each line's team, from MARKET: every book's line of a matchup gets it,
+    and the opponent's lines get 1 - it."""
+    known = dict(MARKET)
+    for k, p in MARKET.items():
+        known.setdefault("|".join(k.split("|")[::-1]), 1 - p)
+    return (team.map(team_key) + "|" + opponent.map(team_key)).map(known)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,9 @@ Where the data comes from (found with `discover` on 2026-11-02):
     one entry per past match with the line, each book's prices and both teams' implied win chances. Its
     matchKey is "<scheduled US Eastern date>-<opponent id>", and the opponent id is the gamelog's vsId.
     It is a website route, so it is called from inside the logged-in page (it uses cookies, not a token).
+  - www GET /api/cs2/matches/{fixture id}/odds?map=1 is a match's odds (2026-11-04 discover): Thunderpick's
+    series moneyline per team, map handicap, total maps, correct scores and the map-1 moneyline. Fixture ids are
+    OpticOdds', e.g. 202611045E87085E.
 """
 import json
 import os
@@ -19,11 +22,14 @@ import re
 import sys
 import time
 from contextlib import contextmanager
+from math import comb
 from urllib.parse import quote, urlencode
 
+import numpy as np
 import pandas as pd
 
 from cs2props.lines import COLS, http
+from cs2props.model import american_to_prob, team_key
 
 API, SITE = "https://api-v2.pickfinder.app", "https://www.pickfinder.app"
 MARKETS = {"Maps 1-2 Kills": "kills", "Maps 1-2 HS": "headshots"}  # PickFinder's display names
@@ -84,6 +90,42 @@ def current_props(get):
         if not d.get("items") or page >= d.get("totalPages", 1):
             return
         page += 1
+
+
+# An OpticOdds fixture id, e.g. "202611045E87085E". It is found in a props item by its format, because the props
+# response that carries it hasn't been inspected; a prop without one simply gets no market odds.
+FIXTURE = re.compile(r'"(\d{8}[0-9A-F]{8})"')
+
+
+def map_win_probs(odds):
+    """{team_key(name): the market's chance to win a map} from a match-odds response: the series moneyline with
+    the vig removed, then the per-map chance that wins a best-of-num_periods series that often (maps independent),
+    so it means what the model's Elo win_prob means."""
+    ml = [t.get("moneyline") or {} for t in (odds.get("teams") or {}).values()]
+    implied = {team_key(m.get("name")): american_to_prob(m["price"]) for m in ml if m.get("price")}
+    if len(implied) != 2:
+        return {}
+    need = (int(odds.get("num_periods") or 3) + 1) // 2  # maps needed to win the series
+    p = np.linspace(0, 1, 1001)
+    series = sum(comb(need - 1 + j, j) * p ** need * (1 - p) ** j for j in range(need))
+    total = sum(implied.values())
+    return {team: float(np.interp(prob / total, series, p)) for team, prob in implied.items()}
+
+
+def market_win_prob(page, item, cache):
+    """The market's chance that a props item's team wins a map (NaN if unknown). page(path, **params) fetches a
+    website route; cache maps fixture id -> map_win_probs, so each match's odds are fetched once."""
+    for fixture in dict.fromkeys(FIXTURE.findall(json.dumps(item))):  # usually one; the first with odds wins
+        if fixture not in cache:
+            try:
+                cache[fixture] = map_win_probs(page(f"/api/cs2/matches/{fixture}/odds", map=1))
+            except Exception as e:  # one match's odds must not lose the lines
+                print(f"odds for match {fixture}: FAILED {e!r}", file=sys.stderr)
+                cache[fixture] = {}
+        if cache[fixture]:
+            team, opp = (team_key((item.get(k) or {}).get("name")) for k in ("team", "opponent"))
+            return cache[fixture].get(team, np.nan) if opp in cache[fixture] else np.nan  # else sides could swap
+    return np.nan
 
 
 def series_results(games):

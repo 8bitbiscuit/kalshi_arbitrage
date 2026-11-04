@@ -17,7 +17,8 @@ python -m cs2props.history
 ```
 
 2. Fetch current lines from PrizePicks, Underdog and Sleeper. Add `--pickfinder` to include every book
-   PickFinder tracks.
+   PickFinder tracks and the market's win chance for each match, which the model then uses instead of its
+   own Elo (it prints how many lines got one).
 
 ```bash
 python -m cs2props.lines
