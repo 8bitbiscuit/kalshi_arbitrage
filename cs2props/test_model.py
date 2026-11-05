@@ -170,7 +170,7 @@ def test_pickfinder_history_rows():
               underdog=dict(outcomes=dict(over=side(-115), under=side(-115))),
               goblin=dict(outcomes=dict(over=side(-155, modifier="goblin")))),
         {**entry("2025-11-01-133719", 26.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-110)))),
-         "team_ml_percent": 0.6154, "opponent_ml_percent": 0.3846},
+         "teamOdds": dict(implied=0.6154, american=-200), "opponentOdds": dict(implied=0.3846)},
         entry("2025-11-09-133719", 25.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-115)))),  # not played
         entry("2025-09-07-500", 27.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-115)))),  # ambiguous
         entry("2025-09-01-77", 27.5, underdog=dict(outcomes=dict(over=side(-115), under=side(-115)))),
@@ -183,12 +183,44 @@ def test_pickfinder_history_rows():
     assert np.isnan(rows[0]["market_win_prob"]) and abs(rows[2]["market_win_prob"] - 0.5776) < 0.001
 
 
-def test_map_win_prob():
+def test_market_moneyline():
     from cs2props import pickfinder
     # A real props item (Legacy vs B8, 2026-11-03): team_ml -200, opponent_ml +140, team_ml_percent 0.6154
     legacy, b8 = pickfinder.map_win_prob(0.6154), pickfinder.map_win_prob(0.3846)
     assert abs(legacy - 0.5776) < 0.001 and abs(legacy + b8 - 1) < 1e-3 and pickfinder.map_win_prob(0.5) == 0.5
     assert all(np.isnan(pickfinder.map_win_prob(x)) for x in (None, 0, 1, float("nan")))  # missing, not a certainty
+    # BetBoom vs FURIA, 2026-11-06: the props item, its bare moneylines, and the Prop History entry all agree
+    props = dict(team_ml=138, opponent_ml=-196, team_ml_percent=0.3882, opponent_ml_percent=0.6118)
+    assert pickfinder.series_win_prob(props) == 0.3882
+    assert abs(pickfinder.series_win_prob(dict(team_ml=138, opponent_ml=-196)) - 0.3882) < 1e-4
+    assert pickfinder.series_win_prob(dict(teamOdds=dict(implied=0.3882, american=138))) == 0.3882
+    assert np.isnan(pickfinder.series_win_prob(dict(matchKey="2026-11-04-3213", line=14.5)))  # entry without odds
+
+
+def test_pickfinder_lines_pull_the_moneyline(monkeypatch):
+    from contextlib import contextmanager
+    from cs2props import pickfinder
+    item = dict(fixture_id="2026110686A63993", player_id="bn3mlvy0cst11z3", player_name="s1ren", isAltLine=False,
+                team=dict(name="BetBoom Team"), opponent=dict(name="FURIA"), line=26.5, start_date="2026-11-06T09:45:00Z",
+                market_id="1st_2_maps_player_kills",
+                apps=dict(dabble=dict(outcomes=dict(over=dict(price=-122, modifier=""), under=dict(price=-122, modifier="")))))
+    calls = []
+
+    @contextmanager
+    def session(priced):  # /props without the moneyline unless `priced`; a player's own props always carry it
+        def get(path, **params):
+            calls.append((path, params.get("moneylines")))
+            ml = dict(team_ml=138, opponent_ml=-196, team_ml_percent=0.3882)
+            return {"items": [{**item, **(ml if priced else {})}], "totalPages": 1} if path == "/props" else [{**item, **ml}]
+        yield get
+
+    for priced in (False, True):
+        calls.clear()
+        lines.MARKET.clear()
+        monkeypatch.setattr(pickfinder, "session", lambda: session(priced))
+        rows = list(lines.pickfinder())
+        assert [r["book"] for r in rows] == ["dabble"] and abs(lines.MARKET["betboom|furia"] - 0.4249) < 1e-3
+        assert calls == [("/props", 1)] + ([] if priced else [("/players/bn3mlvy0cst11z3/props", None)])
 
 
 def test_lines_market_and_history(tmp_path, monkeypatch):
@@ -205,7 +237,8 @@ def test_lines_market_and_history(tmp_path, monkeypatch):
                                                          opponent="G2 Esports", **row)])
     monkeypatch.setattr(lines, "sleeper", lambda: [])
     monkeypatch.setattr(lines, "pickfinder", lambda: lines.MARKET.update({"g2|aurora": 0.45}) or [])
-    monkeypatch.setattr(lines.sys, "argv", ["lines", "--pickfinder"])
+    monkeypatch.setattr(lines.sys, "argv", ["lines"])
+    monkeypatch.setenv("PICKFINDER_EMAIL", "me@example.com")  # a login set: PickFinder runs by default
     lines.main()
     hist = pd.read_csv(lines.HISTORY_CSV)
     assert list(hist.player) == ["old", "huNter-", "woxic"] and hist.market_win_prob.isna().tolist() == [True, False, False]

@@ -66,7 +66,7 @@ The same things PickFinder shows in the screenshots, built so nothing from the p
 | `hs_pct` | Headshots / kills over the last 20 maps | HS % |
 | `adr_l20`, `kast_l20` | Damage per round, KAST | K/D, rating |
 | `map_factor` | Player's KPR on each map (shrunk toward overall KPR with a 100-round prior), weighted by how often **both teams** played each map in their last 15 maps, divided by overall KPR | Map Picks + per-map Kills/KPR |
-| `win_prob`, `elo_opp` | Map-level Elo built from every bo3.gg result; win probability for the player's team and opponent strength. A team id seen for the first time (a roster moving org, e.g. LP to BARCA) starts from its players' previous teams' ratings. When a line carries the market's win chance (`lines --pickfinder`), that replaces the Elo's `win_prob` (see section 4) | Moneyline implied win % |
+| `win_prob`, `elo_opp` | Map-level Elo built from every bo3.gg result; win probability for the player's team and opponent strength. A team id seen for the first time (a roster moving org, e.g. LP to BARCA) starts from its players' previous teams' ratings. When a line carries the market's moneyline (from PickFinder, by default whenever its login is set), its win chance replaces the Elo's `win_prob` (see section 4) | Moneyline implied win % |
 | `sched_gap` | Today's opponent Elo minus the mean pre-match Elo of the player's last 20 opponents, so a 20-map average earned against weaker (or stronger) teams than today's is not taken at face value. Unlike `elo_opp` it doesn't drift with Elo inflation | Opponent rank vs recent schedule |
 | `maps_played` | Experience; lets the model distrust thin histories | sample size |
 
@@ -185,7 +185,7 @@ All verified live on 2026-10-30, no login or browser needed:
 | Underdog | `api.underdogfantasy.com/v1/over_under_lines?sport_id=CS` | Standard pick'em payout, so the same default breakeven as PrizePicks. The feed's `-112` tag is not what a pick'em entry pays |
 | Sleeper | `api.sleeper.app/lines/available` + `/players/cs` + `/scores/lines_game_picker` | Payout multipliers converted to American odds (1.78 → -128, as in the screenshot) |
 | PickFinder (optional) | `api-v2.pickfinder.app/props?sport=cs2` with the logged-in `__session` token | Replaces the screenshot + OCR. Adds DraftKings Pick6, Dabble, ParlayPlay, ThunderPick, and others. **Untested**, needs your login |
-| The market's win chance (with `--pickfinder`) | Each PickFinder props item's `team_ml_percent`: Thunderpick's series moneyline with the vig removed (e.g. Legacy -200 / B8 +140 is 0.6154 / 0.3846) | Turned into the chance to win a map (best of 3, maps independent) so it means what the Elo `win_prob` means. Every book's line of that matchup gets it as `market_win_prob`, and the model uses it in place of the Elo's. `lines` prints how many lines got one |
+| The market's moneyline (with PickFinder) | `/props?moneylines=1` items' `team_ml_percent` (Thunderpick's series moneyline with the vig removed, e.g. Legacy -200 / B8 +140 is 0.6154 / 0.3846), or `team_ml` / `opponent_ml`; a match the list leaves unpriced is read from one of its players' `/players/{id}/props` | Turned into the chance to win a map (best of 3, maps independent) so it means what the Elo `win_prob` means. Every book's line of that matchup gets it as `market_win_prob`, and the model uses it in place of the Elo's. `lines` and `predict` print how many lines had it |
 
 Every scrape is appended to `data/lines_history.csv`.
 
@@ -268,8 +268,9 @@ behind the Prop History panel. It is a website route, keyed by the player's Opti
 https://www.pickfinder.app/api/players/{player_oo_id}/props/historical?stat=Maps%201-2%20Kills
 ```
 
-It returns one entry per past match with the line, each book's prices and both teams' implied win
-chances, but no result. Its match key is the scheduled US Eastern date plus the opponent's id, which is
+It returns one entry per past match with the line, each book's prices and the market's moneyline as of
+then (`teamOdds: {implied: 0.3882, american: 138}`, `opponentOdds: {implied: 0.6118}`, vig removed), but no
+result. The moneyline becomes each row's `market_win_prob`, which the backtest uses in place of the Elo. Its match key is the scheduled US Eastern date plus the opponent's id, which is
 the same id the player's game log (`/players/{id}/gamelog`) uses. So each entry is joined to the series
 against that opponent within a day of that date, and the result is the sum of maps 1 and 2 from the
 game log:
@@ -296,12 +297,10 @@ request, but check PickFinder's terms before running it often.
 
 Next steps, in order of value:
 
-- **Check the market's win chance on past lines.** Current lines get it from the props list (section 4) and
-  our archive keeps it, and `pickfinder history` now reads it from the Prop History entries as
-  `team_ml_percent`. That is the props list's name for it and is unverified for history entries, so the run
-  prints how many past lines had it. A backtest then reports whether it beat our Elo ("Market win chance on
-  N graded lines: projection error ..."). On bo3.gg, a 20-point drop in win chance moves the projection by
-  -0.38 kills on average (up to -1.8); a rise barely moves it, as blowouts hurt the loser.
+- **Check the market's moneyline on past lines.** `pickfinder history` now keeps it (`teamOdds`), so a backtest
+  reports whether it beat our Elo ("Market win chance on N graded lines: projection error ..."). Re-run
+  `history` first: lines saved before this have no moneyline. On bo3.gg, a 20-point drop in win chance moves
+  the projection by -0.38 kills on average (up to -1.8); a rise barely moves it, as blowouts hurt the loser.
 - **A classifier trained on real lines**, beyond the two-number calibration, once there are several
   thousand graded lines: `(features, line) → over?`.
 
@@ -330,7 +329,7 @@ and PickFinder's sportsbook prices are used as given.
 
 ## Credentials
 
-Never put passwords in code. For `--pickfinder`, set them in the environment:
+Never put passwords in code. For PickFinder (`lines` uses it whenever they are set), set them in the environment:
 
 ```bash
 export PICKFINDER_EMAIL='you@example.com'

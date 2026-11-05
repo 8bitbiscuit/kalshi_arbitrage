@@ -6,17 +6,19 @@
 Set PICKFINDER_EMAIL and PICKFINDER_PASSWORD; a Firefox window opens and logs in.
 
 Where the data comes from (found with `discover` on 2026-11-02):
-  - api-v2 GET /props?sport=cs2 lists current props: player ids, names and OpticOdds ids (player_oo_id), the
-    fixture_id, and the market's win chances: team_ml / opponent_ml (Thunderpick moneyline) and
-    team_ml_percent / opponent_ml_percent (the same with the vig removed; checked on 2026-11-04).
+  - api-v2 GET /props?sport=cs2&moneylines=1 lists current props: player ids, names and OpticOdds ids
+    (player_oo_id), the fixture_id and, with moneylines=1 (as PickFinder's own /props/favorites call sends it),
+    the market's moneyline: team_ml / opponent_ml (Thunderpick) and team_ml_percent / opponent_ml_percent (the
+    same with the vig removed). api-v2 GET /players/{player_id}/props, a player's props, always carries them.
   - api-v2 GET /players/{player_id}/gamelog has every series with per-map stats: the results.
   - www GET /api/players/{player_oo_id}/props/historical?stat=Maps 1-2 Kills is the Prop History panel:
-    one entry per past match with the line, each book's prices and both teams' implied win chances (read as
-    team_ml_percent, the props list's name; `history` prints how many entries had it). Its matchKey is
-    "<scheduled US Eastern date>-<opponent id>", and the opponent id is the gamelog's vsId.
+    one entry per past match with the line, each book's prices and the market's moneyline as of then:
+    teamOdds {implied, american} and opponentOdds {implied}, implied with the vig removed (0.3882 + 0.6118).
+    Its matchKey is "<scheduled US Eastern date>-<opponent id>", and the opponent id is the gamelog's vsId.
     It is a website route, so it is called from inside the logged-in page (it uses cookies, not a token).
   - www GET /api/cs2/matches/{fixture_id}/odds?map=1 is a match's odds: Thunderpick's series moneyline, map
-    handicap, total maps, correct scores and the map-1 moneyline (unused: the props list has the moneyline).
+    handicap, total maps, correct scores and the map-1 moneyline (unused: the props carry the moneyline).
+Checked against real responses on 2026-11-04 and 11-05.
 """
 import json
 import os
@@ -30,6 +32,7 @@ import numpy as np
 import pandas as pd
 
 from cs2props.lines import COLS, http
+from cs2props.model import american_to_prob
 
 API, SITE = "https://api-v2.pickfinder.app", "https://www.pickfinder.app"
 MARKETS = {"Maps 1-2 Kills": "kills", "Maps 1-2 HS": "headshots"}  # PickFinder's display names
@@ -85,17 +88,26 @@ def current_props(get):
     """Every current CS2 prop item, all pages."""
     page = 1
     while True:
-        d = get("/props", sport="cs2", page=page, perPage=100)
+        d = get("/props", sport="cs2", page=page, perPage=100, moneylines=1)
         yield from d.get("items", [])
         if not d.get("items") or page >= d.get("totalPages", 1):
             return
         page += 1
 
 
+def series_win_prob(item):
+    """The market's chance that a props or Prop History item's team wins the series, or NaN: Thunderpick's
+    moneyline with the vig removed (props: team_ml_percent, or team_ml and opponent_ml; history: teamOdds)."""
+    p = item.get("team_ml_percent") or (item.get("teamOdds") or {}).get("implied")
+    if not p and item.get("team_ml") and item.get("opponent_ml"):
+        team, opp = american_to_prob(item["team_ml"]), american_to_prob(item["opponent_ml"])
+        p = team / (team + opp)
+    return p if p and 0 < p < 1 else np.nan
+
+
 def map_win_prob(series_p):
-    """The market's chance that a team wins a map, from its chance to win the series (team_ml_percent), so it
-    means what the model's Elo win_prob means; NaN when missing. Maps taken as independent, so a series win is
-    p^2 (3 - 2p).
+    """The market's chance that a team wins a map, from its chance to win the series, so it means what the
+    model's Elo win_prob means; NaN when missing. Maps taken as independent, so a series win is p^2 (3 - 2p).
     ponytail: every series taken as best of 3 (props don't say); a best of 5 would come out a little too lopsided."""
     if not 0 < (series_p or 0) < 1:
         return np.nan
@@ -155,7 +167,7 @@ def player_rows(it, games, history, since):
                     rows.append(dict(book=book, player=it["player_name"], team=r["team"], opponent=r["vs"],
                                      stat=MARKETS[display], maps="1-2", line=book_line(app, h["line"]),
                                      over_odds=prices[0], under_odds=prices[1], start_time=r["start"].isoformat(),
-                                     actual=r[MARKETS[display]], market_win_prob=map_win_prob(h.get("team_ml_percent"))))
+                                     actual=r[MARKETS[display]], market_win_prob=map_win_prob(series_win_prob(h))))
     return rows
 
 
@@ -180,9 +192,7 @@ def history(months=6):
                   f"{len(new)} rows with results")
     key = ["book", "player", "stat", "start_time", "line"]
     df = pd.DataFrame(rows, columns=COLS + ["actual"]).drop_duplicates(key)
-    print(f"market win chance on {df.market_win_prob.notna().sum()} of {len(df)} past lines"
-          + ("" if df.market_win_prob.notna().any() or df.empty else ": its entries lack team_ml_percent, so run "
-             "discover, open Prop History and send the call_*.json holding its entries"))
+    print(f"market moneyline on {df.market_win_prob.notna().sum()} of {len(df)} past lines (the rest use our Elo)")
     if os.path.exists(PROPS_CSV):  # keep earlier runs' lines (other players, older dates); new rows win
         df = pd.concat([df, pd.read_csv(PROPS_CSV)]).drop_duplicates(key)
     df.to_csv(PROPS_CSV, index=False)

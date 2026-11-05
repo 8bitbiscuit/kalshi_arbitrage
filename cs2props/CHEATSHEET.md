@@ -16,9 +16,9 @@ pip install -r cs2props/requirements.txt
 python -m cs2props.history
 ```
 
-2. Fetch current lines from PrizePicks, Underdog and Sleeper. Add `--pickfinder` to include every book
-   PickFinder tracks and the market's win chance for each match, which the model then uses instead of its
-   own Elo (it prints how many lines got one).
+2. Fetch current lines from PrizePicks, Underdog and Sleeper. When your PickFinder login is set (below), it also
+   pulls every book PickFinder tracks and each match's market moneyline, which `predict` uses as the win chance
+   instead of our own Elo. Both print how many lines had a moneyline. Add `--no-pickfinder` to skip it.
 
 ```bash
 python -m cs2props.lines
@@ -46,7 +46,8 @@ python -m cs2props.model compare
 
 ## Backtesting
 
-Pull PickFinder's past lines and results (needs your login). Add a number of months to change the default of 6.
+Pull PickFinder's past lines, results and each match's market moneyline (needs your login). Add a number of
+months to change the default of 6. Lines saved before 2026-11-05 lack the moneyline: re-run it.
 
 ```bash
 python -m cs2props.pickfinder history
@@ -73,7 +74,7 @@ python -m cs2props.pickfinder discover KaiR0N
 
 ## PickFinder login
 
-Needed by `lines --pickfinder`, `pickfinder history` and `pickfinder discover`:
+Used by `lines` (whenever it is set), `pickfinder history` and `pickfinder discover`:
 
 ```bash
 export PICKFINDER_EMAIL='you@example.com'

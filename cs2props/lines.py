@@ -1,11 +1,12 @@
 """Fetch current CS2 player-prop lines into data/lines.csv and append them to data/lines_history.csv.
 
-    python -m cs2props.lines               # PrizePicks + Underdog + Sleeper public JSON feeds, no login
-    python -m cs2props.lines --pickfinder  # also every book PickFinder tracks (DraftKings Pick6, Dabble, ...)
-                                           # and the market's win chance for each match
+    python -m cs2props.lines                  # PrizePicks + Underdog + Sleeper public JSON feeds, and PickFinder
+                                              # when its login is set: every book it tracks (DraftKings Pick6,
+                                              # Dabble, ...) and each match's market moneyline, which predict uses
+    python -m cs2props.lines --no-pickfinder  # the three public feeds only (no login, no moneyline)
 
---pickfinder logs in with Selenium using the PICKFINDER_EMAIL and PICKFINDER_PASSWORD environment
-variables, then reads PickFinder's own JSON API with the session token instead of screenshots + OCR.
+PickFinder logs in with Selenium using the PICKFINDER_EMAIL and PICKFINDER_PASSWORD environment variables,
+then reads its own JSON API with the session token instead of screenshots + OCR.
 """
 import os
 import re
@@ -99,16 +100,26 @@ def sleeper():
 
 
 def pickfinder():
-    from cs2props.pickfinder import current_props, main_prices, map_win_prob, session  # Selenium; see pickfinder.py
+    from cs2props.pickfinder import current_props, main_prices, map_win_prob, series_win_prob, session  # Selenium
 
     with session() as get:
-        for it in current_props(get):
-            if it.get("isAltLine"):
-                continue
-            team, opp = (team_key((it.get(k) or {}).get("name")) for k in ("team", "opponent"))
-            win = map_win_prob(it.get("team_ml_percent"))  # Thunderpick's moneyline, vig removed, per map
-            if win == win:  # not NaN
+        items = [it for it in current_props(get) if not it.get("isAltLine")]
+        # Each match's market moneyline: in the props list, else in one of its players' own props (they carry it).
+        priced = {it.get("fixture_id") for it in items if pd.notna(series_win_prob(it))}
+        extra = []
+        for fixture, player in {it.get("fixture_id"): it.get("player_id") for it in items}.items():
+            if fixture and fixture not in priced:
+                try:
+                    got = get(f"/players/{player}/props")
+                    extra += got if isinstance(got, list) else got.get("items", [])
+                except Exception as e:  # one match's moneyline must not lose the lines
+                    print(f"moneyline for match {fixture}: FAILED {e!r}", file=sys.stderr)
+        for it in items + extra:
+            win = map_win_prob(series_win_prob(it))  # Thunderpick's moneyline, vig removed, per map
+            if pd.notna(win):
+                team, opp = (team_key((it.get(k) or {}).get("name")) for k in ("team", "opponent"))
                 MARKET[f"{team}|{opp}"] = win
+        for it in items:
             for book, app in (it.get("apps") or {}).items():
                 prices = main_prices(app)  # skips goblin/demon/boosted and one-sided lines
                 if book in ("prizepicks", "underdog", "sleeper") or not prices:  # those three are fetched directly
@@ -121,7 +132,9 @@ def pickfinder():
 def main():
     rows = []
     MARKET.clear()
-    for src in [prizepicks, underdog, sleeper] + ([pickfinder] if "--pickfinder" in sys.argv else []):
+    # PickFinder is on whenever its login is set: it brings more books and, above all, the market's moneyline.
+    use_pf = "--pickfinder" in sys.argv or bool(os.environ.get("PICKFINDER_EMAIL")) and "--no-pickfinder" not in sys.argv
+    for src in [prizepicks, underdog, sleeper] + ([pickfinder] if use_pf else []):
         try:
             got = list(src())
         except Exception as e:  # one book being down must not lose the others
@@ -132,8 +145,9 @@ def main():
     df = pd.DataFrame(rows, columns=COLS)
     df["start_time"] = pd.to_datetime(df.start_time, utc=True, format="ISO8601")
     df["market_win_prob"] = market_lookup(df.team, df.opponent)
-    if "--pickfinder" in sys.argv:
-        print(f"market win chance for {df.market_win_prob.notna().sum()} of {len(df)} lines")
+    print(f"market moneyline for {df.market_win_prob.notna().sum()} of {len(df)} lines (predict uses our Elo for "
+          "the rest)" if use_pf else "no market moneyline: set PICKFINDER_EMAIL and PICKFINDER_PASSWORD, or predict "
+          "uses our Elo win chance")
     os.makedirs("data", exist_ok=True)
     df.to_csv(LINES_CSV, index=False)
     hist = df.assign(scraped_at=pd.Timestamp.now(tz="UTC"))

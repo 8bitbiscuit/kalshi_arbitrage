@@ -315,7 +315,7 @@ def score(lines, df, bundles, cal=None):
     known = lines[lines.player_id.notna() & (lines.opp_id != -1)].astype({"player_id": int, "team_id": int, "opp_id": int})
     f = features(known[["line_idx", "player_id", "team_id", "opp_id", "start_date"]], df)
     out = lines.merge(f[["line_idx"] + FEATURES], on="line_idx", how="left")
-    if "market_win_prob" in out:  # the market's win chance (lines.py --pickfinder) is sharper than our Elo's
+    if "market_win_prob" in out:  # the market's moneyline (PickFinder, via lines or pickfinder history) replaces our Elo
         out["elo_win_prob"] = out.win_prob
         out["win_prob"] = pd.to_numeric(out.market_win_prob, errors="coerce").fillna(out.win_prob)
     out["proj"] = out["p_over"] = out["p_under"] = np.nan
@@ -345,6 +345,9 @@ def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
     out.to_csv(PICKS_CSV, index=False)
     print(out[[c for c in cols if c in out]].round(3).to_string(index=False))
     print(f"\n{(out.pick == 'NO DATA').sum()} of {len(out)} lines had no usable history (check 'matched').")
+    scored = out.proj.notna()
+    market = scored & (out.market_win_prob.notna() if "market_win_prob" in out else False)
+    print(f"Win chance: the market's moneyline on {market.sum()} of {scored.sum()} scored lines, our Elo on the rest.")
     print(f"P(over/under) calibrated on real past lines ({CAL_JOBLIB}): {describe_calibration(cal)}" if cal else
           f"P(over/under) NOT calibrated on real lines: run backtest first (it writes {CAL_JOBLIB}).")
 
