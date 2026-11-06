@@ -35,6 +35,9 @@ NEED = {"kills": ["kills_l20", "kpr", "map_factor"], "headshots": ["kills_l20", 
 PRIOR_ROUNDS = 100   # shrink a player's per-map KPR toward their recent KPR by this many rounds
 POOL = 15            # a team's last 15 maps stand in for the unknown veto
 DEFAULT_ODDS = -119  # lines without a price (PrizePicks): breakeven 54.3%, about a 5/6-pick flex entry
+# The books predict shows picks for. The rest (Sleeper, PickFinder's other apps) are still fetched, archived and
+# backtested, and their lines on the same prop are listed next to each pick (other_books).
+MY_BOOKS = ("prizepicks", "underdog")
 
 
 def american_to_prob(odds):
@@ -330,6 +333,20 @@ def score(lines, df, bundles, cal=None):
     return picks(calibrated(out, cal))
 
 
+def other_books(out):
+    """Each line's other books on the same prop (player, opponent, stat, maps), e.g. "sleeper 31.5, dabble 30.5":
+    a book that differs from the rest is a line to shop."""
+    known = out[out.player_id.notna() & (out.opp_id != -1)]
+    if known.empty:
+        return pd.Series("", index=out.index)
+
+    def others(g):
+        return pd.Series([", ".join(f"{b} {ln:g}" for b, ln in zip(g.book, g.line) if b != own) for own in g.book],
+                         index=g.index)
+
+    return known.groupby(["player_id", "opp_id", "stat", "maps"], group_keys=False)[["book", "line"]].apply(others)
+
+
 def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
     df = load(maps_csv)
     bundles = {stat: joblib.load(f"data/model_{stat}.joblib") for stat in STATS}
@@ -339,12 +356,17 @@ def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
     # Only a calibration of these features and this kind of model applies; any other is stale.
     same = (saved.get("features"), saved.get("kind")) == (FEATURES, bundles["kills"]["metrics"]["model"])
     cal = saved.get("cal") if same else None
-    out = score(pd.read_csv(lines_csv), df, bundles, cal).sort_values("edge", ascending=False)
-    cols = ["book", "player", "matched", "team", "opponent", "stat", "line", "proj", "elo_win_prob", "market_win_prob",
-            "p_over", "p_under", "edge", "pick"]
+    out = score(pd.read_csv(lines_csv), df, bundles, cal)
+    out["other_books"] = other_books(out)
+    hidden = ~out.book.isin(MY_BOOKS)
+    out = out[~hidden].sort_values("edge", ascending=False)
+    cols = ["book", "player", "matched", "team", "opponent", "stat", "line", "other_books", "proj", "elo_win_prob",
+            "market_win_prob", "p_over", "p_under", "edge", "pick"]
     out.to_csv(PICKS_CSV, index=False)
     print(out[[c for c in cols if c in out]].round(3).to_string(index=False))
-    print(f"\n{(out.pick == 'NO DATA').sum()} of {len(out)} lines had no usable history (check 'matched').")
+    print(f"\n{(out.pick == 'NO DATA').sum()} of {len(out)} lines had no usable history (check 'matched'). "
+          f"{hidden.sum()} lines from books outside MY_BOOKS are not shown (on props your books also offer, "
+          "they are listed under other_books).")
     scored = out.proj.notna()
     market = scored & (out.market_win_prob.notna() if "market_win_prob" in out else False)
     print(f"Win chance: the market's moneyline on {market.sum()} of {scored.sum()} scored lines, our Elo on the rest.")

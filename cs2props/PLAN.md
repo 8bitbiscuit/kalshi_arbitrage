@@ -202,11 +202,13 @@ Every scrape is appended to `data/lines_history.csv`.
 - **Unmatched opponents:** a line whose opponent can't be matched gets NO DATA rather than being
   scored against an average team.
 
-The output is sorted by edge:
+The output shows only the books in `MY_BOOKS` (PrizePicks and Underdog; set in `model.py`), sorted by edge.
+The other books' lines are still fetched, archived and backtested:
 
 | Column | Meaning |
 |---|---|
 | `matched` | The bo3.gg player used. Eyeball it: stand-ins and renamed players are the main mis-join risk |
+| `other_books` | Every other book's line on the same prop (player, opponent, stat), Sleeper's included, e.g. `sleeper 32.5, dabble 31.5`. A line below the others favours the over, one above them the under |
 | `proj` | Projected maps 1-2 total |
 | `p_over`, `p_under` | Probabilities |
 | `edge` | Probability minus the breakeven implied by the price |

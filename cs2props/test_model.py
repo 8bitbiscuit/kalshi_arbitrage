@@ -76,17 +76,24 @@ def test_train_then_predict(tmp_path, monkeypatch):
     model.train()
     when = "2026-01-01T00:00:00Z"
     pd.DataFrame([  # the book calls player 'max' "MaxOff" and the team "Team Alpha Esports"
-        dict(book="a", player="MaxOff", team="Team Alpha Esports", opponent="Delta", stat="kills", maps="1-2",
+        dict(book="prizepicks", player="MaxOff", team="Team Alpha Esports", opponent="Delta", stat="kills", maps="1-2",
              line=30.5, start_time=when, market_win_prob=0.3),
-        dict(book="b", player="maxoff", team="Alpha", opponent="Delta", stat="headshots", maps="1-2",
+        dict(book="sleeper", player="max", team="Alpha Gaming", opponent="Delta", stat="kills", maps="1-2",  # same prop
+             line=31.5, over_odds=-128, under_odds=-102, start_time=when),
+        dict(book="underdog", player="maxoff", team="Alpha", opponent="Delta", stat="headshots", maps="1-2",
              line=25.5, over_odds=-112, under_odds=-112, start_time=when),
-        dict(book="a", player="p7", team="Bravo", opponent="Charlie", stat="kills", maps="1-3", line=45.5, start_time=when),
-        dict(book="a", player="nobody", team="X", opponent="Y", stat="kills", maps="1-2", line=30.5, start_time=when),
+        dict(book="prizepicks", player="p7", team="Bravo", opponent="Charlie", stat="kills", maps="1-3", line=45.5,
+             start_time=when),
+        dict(book="prizepicks", player="nobody", team="X", opponent="Y", stat="kills", maps="1-2", line=30.5,
+             start_time=when),
         # exact name on another team beats a close name on this team ("p10" is on Charlie)
-        dict(book="a", player="p1", team="Charlie", opponent="Delta", stat="kills", maps="1-2", line=20.5, start_time=when),
+        dict(book="prizepicks", player="p1", team="Charlie", opponent="Delta", stat="kills", maps="1-2", line=20.5,
+             start_time=when),
     ]).to_csv("data/lines.csv", index=False)
     model.predict()
     picks = pd.read_csv("data/picks.csv").set_index(["player", "stat"])
+    assert "sleeper" not in set(picks.book)  # not one of MY_BOOKS: hidden, but its line is listed beside the pick
+    assert picks.loc[("MaxOff", "kills"), "other_books"] == "sleeper 31.5"
     assert picks.loc[("MaxOff", "kills"), "matched"] == "max"
     assert picks.loc[("MaxOff", "kills"), "win_prob"] == 0.3 and picks.loc[("MaxOff", "kills"), "elo_win_prob"] > 0.7
     assert picks.loc[("MaxOff", "kills"), "pick"] == "OVER"         # ~40 expected vs 30.5
