@@ -210,6 +210,7 @@ The other books' lines are still fetched, archived and backtested:
 | `matched` | The bo3.gg player used. Eyeball it: stand-ins and renamed players are the main mis-join risk |
 | `other_books` | Every other book's line on the same prop (player, opponent, stat), Sleeper's included, e.g. `sleeper 32.5, dabble 31.5`. A line below the others favours the over, one above them the under |
 | `proj` | Projected maps 1-2 total |
+| `elo_win`, `market_win` | The chance the player's team wins the series: our Elo's, and the market's moneyline with the vig removed (PickFinder's "Implied Win %"). The model itself uses the chance to win a map, which for a best of 3 is lower (63% for the series is 59% a map); picks.csv keeps those as `elo_win_prob` and `market_win_prob` |
 | `p_over`, `p_under` | Probabilities |
 | `edge` | Probability minus the breakeven implied by the price |
 | `pick` | OVER / UNDER / PASS / NO DATA |

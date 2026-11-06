@@ -318,8 +318,8 @@ def score(lines, df, bundles, cal=None):
     known = lines[lines.player_id.notna() & (lines.opp_id != -1)].astype({"player_id": int, "team_id": int, "opp_id": int})
     f = features(known[["line_idx", "player_id", "team_id", "opp_id", "start_date"]], df)
     out = lines.merge(f[["line_idx"] + FEATURES], on="line_idx", how="left")
+    out["elo_win_prob"] = out.win_prob
     if "market_win_prob" in out:  # the market's moneyline (PickFinder, via lines or pickfinder history) replaces our Elo
-        out["elo_win_prob"] = out.win_prob
         out["win_prob"] = pd.to_numeric(out.market_win_prob, errors="coerce").fillna(out.win_prob)
     out["proj"] = out["p_over"] = out["p_under"] = np.nan
     for stat, bundle in bundles.items():
@@ -337,14 +337,12 @@ def other_books(out):
     """Each line's other books on the same prop (player, opponent, stat, maps), e.g. "sleeper 31.5, dabble 30.5":
     a book that differs from the rest is a line to shop."""
     known = out[out.player_id.notna() & (out.opp_id != -1)]
-    if known.empty:
-        return pd.Series("", index=out.index)
 
-    def others(g):
-        return pd.Series([", ".join(f"{b} {ln:g}" for b, ln in zip(g.book, g.line) if b != own) for own in g.book],
-                         index=g.index)
+    def others(books):  # one prop's books -> for each, every other book's line
+        return [", ".join(f"{b} {known.line[i]:g}" for i, b in books.items() if b != own) for own in books]
 
-    return known.groupby(["player_id", "opp_id", "stat", "maps"], group_keys=False)[["book", "line"]].apply(others)
+    # transform, not apply: apply turns a slate of one prop into a table
+    return known.groupby(["player_id", "opp_id", "stat", "maps"]).book.transform(others) if len(known) else ""
 
 
 def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
@@ -358,10 +356,15 @@ def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
     cal = saved.get("cal") if same else None
     out = score(pd.read_csv(lines_csv), df, bundles, cal)
     out["other_books"] = other_books(out)
+    # The chance the player's team wins the series, our Elo's and the market's: what PickFinder shows as Implied
+    # Win %. The model itself uses the chance to win a map (win_prob), from which a best of 3 is p^2 (3 - 2p).
+    series = lambda p: p * p * (3 - 2 * p)  # noqa: E731
+    out["elo_win"] = series(out.elo_win_prob)
+    out["market_win"] = series(pd.to_numeric(out.get("market_win_prob", out.proj * np.nan), errors="coerce"))
     hidden = ~out.book.isin(MY_BOOKS)
     out = out[~hidden].sort_values("edge", ascending=False)
-    cols = ["book", "player", "matched", "team", "opponent", "stat", "line", "other_books", "proj", "elo_win_prob",
-            "market_win_prob", "p_over", "p_under", "edge", "pick"]
+    cols = ["book", "player", "matched", "team", "opponent", "stat", "line", "other_books", "proj", "elo_win",
+            "market_win", "p_over", "p_under", "edge", "pick"]
     out.to_csv(PICKS_CSV, index=False)
     print(out[[c for c in cols if c in out]].round(3).to_string(index=False))
     print(f"\n{(out.pick == 'NO DATA').sum()} of {len(out)} lines had no usable history (check 'matched'). "
@@ -369,7 +372,8 @@ def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
           "they are listed under other_books).")
     scored = out.proj.notna()
     market = scored & (out.market_win_prob.notna() if "market_win_prob" in out else False)
-    print(f"Win chance: the market's moneyline on {market.sum()} of {scored.sum()} scored lines, our Elo on the rest.")
+    print(f"Win chance: the market's moneyline on {market.sum()} of {scored.sum()} scored lines, our Elo on the rest "
+          "(elo_win and market_win are chances to win the series, like PickFinder's Implied Win %).")
     print(f"P(over/under) calibrated on real past lines ({CAL_JOBLIB}): {describe_calibration(cal)}" if cal else
           f"P(over/under) NOT calibrated on real lines: run backtest first (it writes {CAL_JOBLIB}).")
 

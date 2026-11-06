@@ -96,11 +96,15 @@ def test_train_then_predict(tmp_path, monkeypatch):
     assert picks.loc[("MaxOff", "kills"), "other_books"] == "sleeper 31.5"
     assert picks.loc[("MaxOff", "kills"), "matched"] == "max"
     assert picks.loc[("MaxOff", "kills"), "win_prob"] == 0.3 and picks.loc[("MaxOff", "kills"), "elo_win_prob"] > 0.7
+    assert abs(picks.loc[("MaxOff", "kills"), "market_win"] - 0.216) < 1e-9  # 0.3 a map is 21.6% to win a best of 3
     assert picks.loc[("MaxOff", "kills"), "pick"] == "OVER"         # ~40 expected vs 30.5
     assert picks.loc[("maxoff", "headshots"), "pick"] == "UNDER"    # ~20 expected vs 25.5
     assert picks.loc[("nobody", "kills"), "pick"] == "NO DATA"
     assert picks.loc[("p1", "kills"), "matched"] == "p1 (Alpha Gaming)"
     assert ("p7", "kills") not in picks.index                        # maps 1-3 is not modelled
+    one = pd.DataFrame(dict(player_id=0.0, opp_id=3, stat="kills", maps="1-2", book=["prizepicks", "sleeper"],
+                            line=[30.5, 31.0]))  # a slate of a single prop
+    assert model.other_books(one).tolist() == ["sleeper 31", "prizepicks 30.5"]
 
 
 def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
