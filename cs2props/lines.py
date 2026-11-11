@@ -24,7 +24,9 @@ COLS = ["book", "player", "team", "opponent", "stat", "maps", "line", "over_odds
 MARKET = {}  # "team|opponent" (model.team_key) -> the market's per-map win chance, filled by pickfinder()
 http = requests.Session()
 http.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                                   "Chrome/130.0 Safari/537.36", "Accept": "application/json"})
+                                   "Chrome/130.0 Safari/537.36", "Accept": "application/json",
+                     # No brotli: urllib3 2.6.0 can't decode it (with brotli 1.2), and Underdog sends it when offered
+                     "Accept-Encoding": "gzip, deflate"})
 
 
 def get(url, **params):
