@@ -35,6 +35,10 @@ NEED = {"kills": ["kills_l20", "kpr", "map_factor"], "headshots": ["kills_l20", 
 PRIOR_ROUNDS = 100   # shrink a player's per-map KPR toward their recent KPR by this many rounds
 POOL = 15            # a team's last 15 maps stand in for the unknown veto
 DEFAULT_ODDS = -119  # lines without a price (PrizePicks): breakeven 54.3%, about a 5/6-pick flex entry
+# The books predict shows picks for. The rest (Sleeper, PickFinder's other apps) are still fetched, archived and
+# backtested, and their lines on the same prop are listed next to each pick (other_books).
+MY_BOOKS = ("prizepicks", "underdog")
+BLOWOUT = 0.25  # a team with this chance or less to win the series makes a likely blowout (backtest splits on it)
 
 
 def american_to_prob(odds):
@@ -315,6 +319,9 @@ def score(lines, df, bundles, cal=None):
     known = lines[lines.player_id.notna() & (lines.opp_id != -1)].astype({"player_id": int, "team_id": int, "opp_id": int})
     f = features(known[["line_idx", "player_id", "team_id", "opp_id", "start_date"]], df)
     out = lines.merge(f[["line_idx"] + FEATURES], on="line_idx", how="left")
+    out["elo_win_prob"] = out.win_prob
+    if "market_win_prob" in out:  # the market's moneyline (PickFinder, via lines or pickfinder history) replaces our Elo
+        out["win_prob"] = pd.to_numeric(out.market_win_prob, errors="coerce").fillna(out.win_prob)
     out["proj"] = out["p_over"] = out["p_under"] = np.nan
     for stat, bundle in bundles.items():
         m = (out.stat == stat) & out[NEED[stat]].notna().all(axis=1)
@@ -327,6 +334,18 @@ def score(lines, df, bundles, cal=None):
     return picks(calibrated(out, cal))
 
 
+def other_books(out):
+    """Each line's other books on the same prop (player, opponent, stat, maps), e.g. "sleeper 31.5, dabble 30.5":
+    a book that differs from the rest is a line to shop."""
+    known = out[out.player_id.notna() & (out.opp_id != -1)]
+
+    def others(books):  # one prop's books -> for each, every other book's line
+        return [", ".join(f"{b} {known.line[i]:g}" for i, b in books.items() if b != own) for own in books]
+
+    # transform, not apply: apply turns a slate of one prop into a table
+    return known.groupby(["player_id", "opp_id", "stat", "maps"]).book.transform(others) if len(known) else ""
+
+
 def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
     df = load(maps_csv)
     bundles = {stat: joblib.load(f"data/model_{stat}.joblib") for stat in STATS}
@@ -336,11 +355,26 @@ def predict(lines_csv=LINES_CSV, maps_csv=MAPS_CSV):
     # Only a calibration of these features and this kind of model applies; any other is stale.
     same = (saved.get("features"), saved.get("kind")) == (FEATURES, bundles["kills"]["metrics"]["model"])
     cal = saved.get("cal") if same else None
-    out = score(pd.read_csv(lines_csv), df, bundles, cal).sort_values("edge", ascending=False)
-    cols = ["book", "player", "matched", "team", "opponent", "stat", "line", "proj", "p_over", "p_under", "edge", "pick"]
+    out = score(pd.read_csv(lines_csv), df, bundles, cal)
+    out["other_books"] = other_books(out)
+    # The chance the player's team wins the series, our Elo's and the market's: what PickFinder shows as Implied
+    # Win %. The model itself uses the chance to win a map (win_prob), from which a best of 3 is p^2 (3 - 2p).
+    series = lambda p: p * p * (3 - 2 * p)  # noqa: E731
+    out["elo_win"] = series(out.elo_win_prob)
+    out["market_win"] = series(pd.to_numeric(out.get("market_win_prob", out.proj * np.nan), errors="coerce"))
+    hidden = ~out.book.isin(MY_BOOKS)
+    out = out[~hidden].sort_values("edge", ascending=False)
+    cols = ["book", "player", "matched", "team", "opponent", "stat", "line", "other_books", "proj", "elo_win",
+            "market_win", "p_over", "p_under", "edge", "pick"]
     out.to_csv(PICKS_CSV, index=False)
     print(out[[c for c in cols if c in out]].round(3).to_string(index=False))
-    print(f"\n{(out.pick == 'NO DATA').sum()} of {len(out)} lines had no usable history (check 'matched').")
+    print(f"\n{(out.pick == 'NO DATA').sum()} of {len(out)} lines had no usable history (check 'matched'). "
+          f"{hidden.sum()} lines from books outside MY_BOOKS are not shown (on props your books also offer, "
+          "they are listed under other_books).")
+    scored = out.proj.notna()
+    market = scored & (out.market_win_prob.notna() if "market_win_prob" in out else False)
+    print(f"Win chance: the market's moneyline on {market.sum()} of {scored.sum()} scored lines, our Elo on the rest "
+          "(elo_win and market_win are chances to win the series, like PickFinder's Implied Win %).")
     print(f"P(over/under) calibrated on real past lines ({CAL_JOBLIB}): {describe_calibration(cal)}" if cal else
           f"P(over/under) NOT calibrated on real lines: run backtest first (it writes {CAL_JOBLIB}).")
 
@@ -371,6 +405,19 @@ def summary(g):
                       "units": g.units.sum(), "roi": g.units.sum() / max(len(g), 1)})
 
 
+def blowouts(bet):
+    """The bets with and without likely blowouts: matches where a team's chance to win the series is BLOWOUT or
+    less (the market's moneyline where known, else our Elo). The blowouts are split by side and pick, as a big
+    underdog's low line can look like an OVER that the expected beating then sinks."""
+    series = bet.win_prob ** 2 * (3 - 2 * bet.win_prob)  # win_prob is per map; a best of 3 is p^2 (3 - 2p)
+    lopsided = (series <= BLOWOUT) | (series >= 1 - BLOWOUT)
+    side = np.where(series < 0.5, "underdog", "favorite")
+    groups = {"all bets": bet, "no likely blowout": bet[~lopsided], "likely blowout": bet[lopsided]}
+    groups.update({f"  {s} {pick}": bet[lopsided & (side == s) & (bet.pick == pick)]
+                   for s in ("underdog", "favorite") for pick in ("OVER", "UNDER")})
+    return pd.DataFrame({name: summary(g) for name, g in groups.items() if len(g)}).T
+
+
 def report(out, title):
     """Hit rate, units and ROI of the picks in graded lines `out`, split several ways, and a calibration table."""
     bet = bets(out)
@@ -381,6 +428,8 @@ def report(out, title):
         bet["edge_bucket"] = pd.cut(bet.edge, [0, 0.05, 0.10, 1], labels=["0-5%", "5-10%", "10%+"])
         for col in ("edge_bucket", "stat", "pick", "book"):
             print(f"\nBy {col}:\n" + bet.groupby(col, observed=True).apply(summary, include_groups=False).round(3).to_string())
+        print(f"\nBy likely blowout (a team at {BLOWOUT:.0%} or less to win the series):\n"
+              + blowouts(bet).round(3).to_string())
     cal = out[out.result != "PUSH"].assign(bin=lambda d: pd.cut(d.p_over, [0, .3, .4, .5, .6, .7, 1]))
     print("\nCalibration (predicted P(over) vs actual over rate):\n" + cal.groupby("bin", observed=True).agg(
         lines=("p_over", "size"), predicted=("p_over", "mean"),
@@ -430,7 +479,11 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     for month, chunk in props.groupby("month"):
         bundles = fit_models(feats[feats.start_date < known(month)], kind, verbose=False, params=params)
         params = {stat: b["params"] for stat, b in bundles.items()}
-        parts.append(score(chunk.drop(columns=["start_date", "player_id", "team_id", "opp_id", "matched"]), df, bundles))
+        lines = chunk.drop(columns=["start_date", "player_id", "team_id", "opp_id", "matched"])
+        part = score(lines, df, bundles)
+        if "market_win_prob" in lines and lines.market_win_prob.notna().any():  # the same lines on our Elo alone
+            part["proj_elo"] = score(lines.drop(columns="market_win_prob"), df, bundles).proj.to_numpy()
+        parts.append(part)
     out = pd.concat(parts, ignore_index=True)
 
     bo3 = pd.Series(np.where(out.stat == "kills", out.kills_m12, out.headshots_m12), index=out.index)
@@ -448,6 +501,12 @@ def backtest(props_csv=PROPS_CSV, kind=MODEL, maps_csv=MAPS_CSV):
     bet = report(out, f"{kind} model, refit monthly")
     over_rate = (out.result == "OVER")[out.result != "PUSH"].mean()
     print(f"\nBaselines: always OVER hits {over_rate:.1%}, always UNDER hits {1 - over_rate:.1%}")
+    if "proj_elo" in out:  # did the market's win chance make projections better than our Elo's?
+        mk = out.proj_elo.notna() & out.market_win_prob.notna()
+        err = lambda p: (out.actual - p)[mk]  # noqa: E731
+        print(f"Market win chance on {mk.sum()} graded lines: projection error {err(out.proj).abs().mean():.2f} "
+              f"(bias {err(out.proj).mean():+.2f}) vs {err(out.proj_elo).abs().mean():.2f} "
+              f"(bias {err(out.proj_elo).mean():+.2f}) with our Elo's")
     # Line shopping, no model: where books post different lines on one series, take the side the gap favours.
     # Our archive's lines are compared within one scrape only (a pulled line next to another book's later,
     # moved one was never on offer). PickFinder's lines carry no time, so there the books may not overlap.

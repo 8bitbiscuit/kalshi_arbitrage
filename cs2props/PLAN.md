@@ -66,7 +66,7 @@ The same things PickFinder shows in the screenshots, built so nothing from the p
 | `hs_pct` | Headshots / kills over the last 20 maps | HS % |
 | `adr_l20`, `kast_l20` | Damage per round, KAST | K/D, rating |
 | `map_factor` | Player's KPR on each map (shrunk toward overall KPR with a 100-round prior), weighted by how often **both teams** played each map in their last 15 maps, divided by overall KPR | Map Picks + per-map Kills/KPR |
-| `win_prob`, `elo_opp` | Map-level Elo built from every bo3.gg result; win probability for the player's team and opponent strength. A team id seen for the first time (a roster moving org, e.g. LP to BARCA) starts from its players' previous teams' ratings | Moneyline implied win % |
+| `win_prob`, `elo_opp` | Map-level Elo built from every bo3.gg result; win probability for the player's team and opponent strength. A team id seen for the first time (a roster moving org, e.g. LP to BARCA) starts from its players' previous teams' ratings. When a line carries the market's moneyline (from PickFinder, by default whenever its login is set), its win chance replaces the Elo's `win_prob` (see section 4) | Moneyline implied win % |
 | `sched_gap` | Today's opponent Elo minus the mean pre-match Elo of the player's last 20 opponents, so a 20-map average earned against weaker (or stronger) teams than today's is not taken at face value. Unlike `elo_opp` it doesn't drift with Elo inflation | Opponent rank vs recent schedule |
 | `maps_played` | Experience; lets the model distrust thin histories | sample size |
 
@@ -76,7 +76,9 @@ something it can't use live.
 
 Why our own Elo instead of the sportsbook moneyline: there is no history of pre-match odds (bo3.gg only
 keeps the last, post-result price), so a book price can't be a training feature. Elo is computed the same
-way in training and live.
+way in training and live. At prediction time, though, the market's win chance (PickFinder's props list,
+section 4) replaces the Elo's `win_prob` where a line has it: the model then reacts to the market's view of
+the matchup with the response it learned for Elo.
 
 ## 3. Model
 
@@ -179,10 +181,11 @@ All verified live on 2026-10-30, no login or browser needed:
 
 | Book | Endpoint | Notes |
 |---|---|---|
-| PrizePicks | `partner-api.prizepicks.com/projections?league_id=265` | Main `api.prizepicks.com` is DataDome-blocked; the partner host is open. Standard lines only (goblin/demon are over-only). No price, so breakeven defaults to 54.3% |
+| PrizePicks | `partner-api.prizepicks.com/projections?league_id=265` | Main `api.prizepicks.com` is DataDome-blocked; the partner host is open. Standard lines only (goblin/demon are over-only). Combo props ("A + B + C", a sum of several players) are dropped for every book; PrizePicks' own `combo` flag isn't used, as it also marks single players. No price, so breakeven defaults to 54.3% |
 | Underdog | `api.underdogfantasy.com/v1/over_under_lines?sport_id=CS` | Standard pick'em payout, so the same default breakeven as PrizePicks. The feed's `-112` tag is not what a pick'em entry pays |
 | Sleeper | `api.sleeper.app/lines/available` + `/players/cs` + `/scores/lines_game_picker` | Payout multipliers converted to American odds (1.78 → -128, as in the screenshot) |
 | PickFinder (optional) | `api-v2.pickfinder.app/props?sport=cs2` with the logged-in `__session` token | Replaces the screenshot + OCR. Adds DraftKings Pick6, Dabble, ParlayPlay, ThunderPick, and others. **Untested**, needs your login |
+| The market's moneyline (with PickFinder) | `/props?moneylines=1` items' `team_ml_percent` (Thunderpick's series moneyline with the vig removed, e.g. Legacy -200 / B8 +140 is 0.6154 / 0.3846), or `team_ml` / `opponent_ml`; a match the list leaves unpriced is read from one of its players' `/players/{id}/props` | Turned into the chance to win a map (best of 3, maps independent) so it means what the Elo `win_prob` means. Every book's line of that matchup gets it as `market_win_prob`, and the model uses it in place of the Elo's. `lines` and `predict` print how many lines had it |
 
 Every scrape is appended to `data/lines_history.csv`.
 
@@ -199,12 +202,15 @@ Every scrape is appended to `data/lines_history.csv`.
 - **Unmatched opponents:** a line whose opponent can't be matched gets NO DATA rather than being
   scored against an average team.
 
-The output is sorted by edge:
+The output shows only the books in `MY_BOOKS` (PrizePicks and Underdog; set in `model.py`), sorted by edge.
+The other books' lines are still fetched, archived and backtested:
 
 | Column | Meaning |
 |---|---|
 | `matched` | The bo3.gg player used. Eyeball it: stand-ins and renamed players are the main mis-join risk |
+| `other_books` | Every other book's line on the same prop (player, opponent, stat), Sleeper's included, e.g. `sleeper 32.5, dabble 31.5`. A line below the others favours the over, one above them the under |
 | `proj` | Projected maps 1-2 total |
+| `elo_win`, `market_win` | The chance the player's team wins the series: our Elo's, and the market's moneyline with the vig removed (PickFinder's "Implied Win %"). The model itself uses the chance to win a map, which for a best of 3 is lower (63% for the series is 59% a map); picks.csv keeps those as `elo_win_prob` and `market_win_prob` |
 | `p_over`, `p_under` | Probabilities |
 | `edge` | Probability minus the breakeven implied by the price |
 | `pick` | OVER / UNDER / PASS / NO DATA |
@@ -241,6 +247,9 @@ are two sources:
   - all of that split by edge bucket, stat, OVER/UNDER and book
   - "always over / always under" baselines
   - a calibration table (predicted P(over) vs actual)
+  - by likely blowout: the bets with and without matches where a team has `BLOWOUT` (25%) or less to win the
+    series (the market moneyline where known, else our Elo), the blowouts split into underdog/favorite and
+    OVER/UNDER, to check whether a big underdog's low line draws OVERs that the expected beating sinks
   - line shopping: where two books post different lines on one series, how often the side the gap favours
     wins (over at the lower line, under at the higher), with no model at all. Our archive's lines are only
     compared within one scrape; PickFinder's carry no time, so there the two lines may never have coexisted
@@ -265,8 +274,9 @@ behind the Prop History panel. It is a website route, keyed by the player's Opti
 https://www.pickfinder.app/api/players/{player_oo_id}/props/historical?stat=Maps%201-2%20Kills
 ```
 
-It returns one entry per past match with the line, each book's prices and both teams' implied win
-chances, but no result. Its match key is the scheduled US Eastern date plus the opponent's id, which is
+It returns one entry per past match with the line, each book's prices and the market's moneyline as of
+then (`teamOdds: {implied: 0.3882, american: 138}`, `opponentOdds: {implied: 0.6118}`, vig removed), but no
+result. The moneyline becomes each row's `market_win_prob`, which the backtest uses in place of the Elo. Its match key is the scheduled US Eastern date plus the opponent's id, which is
 the same id the player's game log (`/players/{id}/gamelog`) uses. So each entry is joined to the series
 against that opponent within a day of that date, and the result is the sum of maps 1 and 2 from the
 game log:
@@ -293,9 +303,10 @@ request, but check PickFinder's terms before running it often.
 
 Next steps, in order of value:
 
-- **The market's win probability.** PickFinder's prop history carries both teams' implied win chances, but
-  `pickfinder.py` drops them. Kept, they are a far sharper win chance than our ratings, usable in the
-  calibration (as `market − model` win probability) and at predict time.
+- **Check the market's moneyline on past lines.** `pickfinder history` now keeps it (`teamOdds`), so a backtest
+  reports whether it beat our Elo ("Market win chance on N graded lines: projection error ..."). Re-run
+  `history` first: lines saved before this have no moneyline. On bo3.gg, a 20-point drop in win chance moves
+  the projection by -0.38 kills on average (up to -1.8); a rise barely moves it, as blowouts hurt the loser.
 - **A classifier trained on real lines**, beyond the two-number calibration, once there are several
   thousand graded lines: `(features, line) → over?`.
 
@@ -324,7 +335,7 @@ and PickFinder's sportsbook prices are used as given.
 
 ## Credentials
 
-Never put passwords in code. For `--pickfinder`, set them in the environment:
+Never put passwords in code. For PickFinder (`lines` uses it whenever they are set), set them in the environment:
 
 ```bash
 export PICKFINDER_EMAIL='you@example.com'

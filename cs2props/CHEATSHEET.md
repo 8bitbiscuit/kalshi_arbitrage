@@ -16,8 +16,9 @@ pip install -r cs2props/requirements.txt
 python -m cs2props.history
 ```
 
-2. Fetch current lines from PrizePicks, Underdog and Sleeper. Add `--pickfinder` to include every book
-   PickFinder tracks.
+2. Fetch current lines from PrizePicks, Underdog and Sleeper. When your PickFinder login is set (below), it also
+   pulls every book PickFinder tracks and each match's market moneyline, which `predict` uses as the win chance
+   instead of our own Elo. Both print how many lines had a moneyline. Add `--no-pickfinder` to skip it.
 
 ```bash
 python -m cs2props.lines
@@ -45,7 +46,8 @@ python -m cs2props.model compare
 
 ## Backtesting
 
-Pull PickFinder's past lines and results (needs your login). Add a number of months to change the default of 6.
+Pull PickFinder's past lines, results and each match's market moneyline (needs your login). Add a number of
+months to change the default of 6. Lines saved before 2026-11-05 lack the moneyline: re-run it.
 
 ```bash
 python -m cs2props.pickfinder history
@@ -72,7 +74,7 @@ python -m cs2props.pickfinder discover KaiR0N
 
 ## PickFinder login
 
-Needed by `lines --pickfinder`, `pickfinder history` and `pickfinder discover`:
+Used by `lines` (whenever it is set), `pickfinder history` and `pickfinder discover`:
 
 ```bash
 export PICKFINDER_EMAIL='you@example.com'
@@ -95,6 +97,12 @@ At the top of `cs2props/model.py`:
 - `DEFAULT_ODDS` is the breakeven for apps that don't show a price. The default -119 means 54.3% per pick.
   A 2-pick power play needs -137.
 - `MODEL` is `"gbm"` for gradient boosting or `"tree"` for a single tree.
+- `BLOWOUT` (0.25): a match where a team has this chance or less to win the series counts as a likely blowout.
+  The backtest reports the picks with and without those matches ("By likely blowout"); `predict` doesn't filter
+  on it yet.
+- `MY_BOOKS` are the books `predict` shows picks for: PrizePicks and Underdog. Sleeper and PickFinder's other
+  apps are still fetched, archived and backtested, and their lines on the same prop are listed next to each
+  pick under `other_books`.
 
 ## Files in `data/`
 
