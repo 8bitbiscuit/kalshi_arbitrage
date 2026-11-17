@@ -181,7 +181,7 @@ All verified live on 2026-10-30, no login or browser needed:
 
 | Book | Endpoint | Notes |
 |---|---|---|
-| PrizePicks | `partner-api.prizepicks.com/projections?league_id=265` | Main `api.prizepicks.com` is DataDome-blocked; the partner host is open. Standard lines only (goblin/demon are over-only). No price, so breakeven defaults to 54.3% |
+| PrizePicks | `partner-api.prizepicks.com/projections?league_id=265` | Main `api.prizepicks.com` is DataDome-blocked; the partner host is open. Standard lines only (goblin/demon are over-only). Combo props ("A + B + C", a sum of several players) are dropped for every book; PrizePicks' own `combo` flag isn't used, as it also marks single players. No price, so breakeven defaults to 54.3% |
 | Underdog | `api.underdogfantasy.com/v1/over_under_lines?sport_id=CS` | Standard pick'em payout, so the same default breakeven as PrizePicks. The feed's `-112` tag is not what a pick'em entry pays |
 | Sleeper | `api.sleeper.app/lines/available` + `/players/cs` + `/scores/lines_game_picker` | Payout multipliers converted to American odds (1.78 → -128, as in the screenshot) |
 | PickFinder (optional) | `api-v2.pickfinder.app/props?sport=cs2` with the logged-in `__session` token | Replaces the screenshot + OCR. Adds DraftKings Pick6, Dabble, ParlayPlay, ThunderPick, and others. **Untested**, needs your login |
@@ -247,6 +247,9 @@ are two sources:
   - all of that split by edge bucket, stat, OVER/UNDER and book
   - "always over / always under" baselines
   - a calibration table (predicted P(over) vs actual)
+  - by likely blowout: the bets with and without matches where a team has `BLOWOUT` (25%) or less to win the
+    series (the market moneyline where known, else our Elo), the blowouts split into underdog/favorite and
+    OVER/UNDER, to check whether a big underdog's low line draws OVERs that the expected beating sinks
   - line shopping: where two books post different lines on one series, how often the side the gap favours
     wins (over at the lower line, under at the higher), with no model at all. Our archive's lines are only
     compared within one scrape; PickFinder's carry no time, so there the two lines may never have coexisted

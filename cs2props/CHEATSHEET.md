@@ -97,6 +97,9 @@ At the top of `cs2props/model.py`:
 - `DEFAULT_ODDS` is the breakeven for apps that don't show a price. The default -119 means 54.3% per pick.
   A 2-pick power play needs -137.
 - `MODEL` is `"gbm"` for gradient boosting or `"tree"` for a single tree.
+- `BLOWOUT` (0.25): a match where a team has this chance or less to win the series counts as a likely blowout.
+  The backtest reports the picks with and without those matches ("By likely blowout"); `predict` doesn't filter
+  on it yet.
 - `MY_BOOKS` are the books `predict` shows picks for: PrizePicks and Underdog. Sleeper and PickFinder's other
   apps are still fetched, archived and backtested, and their lines on the same prop are listed next to each
   pick under `other_books`.

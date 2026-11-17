@@ -38,6 +38,7 @@ DEFAULT_ODDS = -119  # lines without a price (PrizePicks): breakeven 54.3%, abou
 # The books predict shows picks for. The rest (Sleeper, PickFinder's other apps) are still fetched, archived and
 # backtested, and their lines on the same prop are listed next to each pick (other_books).
 MY_BOOKS = ("prizepicks", "underdog")
+BLOWOUT = 0.25  # a team with this chance or less to win the series makes a likely blowout (backtest splits on it)
 
 
 def american_to_prob(odds):
@@ -404,6 +405,19 @@ def summary(g):
                       "units": g.units.sum(), "roi": g.units.sum() / max(len(g), 1)})
 
 
+def blowouts(bet):
+    """The bets with and without likely blowouts: matches where a team's chance to win the series is BLOWOUT or
+    less (the market's moneyline where known, else our Elo). The blowouts are split by side and pick, as a big
+    underdog's low line can look like an OVER that the expected beating then sinks."""
+    series = bet.win_prob ** 2 * (3 - 2 * bet.win_prob)  # win_prob is per map; a best of 3 is p^2 (3 - 2p)
+    lopsided = (series <= BLOWOUT) | (series >= 1 - BLOWOUT)
+    side = np.where(series < 0.5, "underdog", "favorite")
+    groups = {"all bets": bet, "no likely blowout": bet[~lopsided], "likely blowout": bet[lopsided]}
+    groups.update({f"  {s} {pick}": bet[lopsided & (side == s) & (bet.pick == pick)]
+                   for s in ("underdog", "favorite") for pick in ("OVER", "UNDER")})
+    return pd.DataFrame({name: summary(g) for name, g in groups.items() if len(g)}).T
+
+
 def report(out, title):
     """Hit rate, units and ROI of the picks in graded lines `out`, split several ways, and a calibration table."""
     bet = bets(out)
@@ -414,6 +428,8 @@ def report(out, title):
         bet["edge_bucket"] = pd.cut(bet.edge, [0, 0.05, 0.10, 1], labels=["0-5%", "5-10%", "10%+"])
         for col in ("edge_bucket", "stat", "pick", "book"):
             print(f"\nBy {col}:\n" + bet.groupby(col, observed=True).apply(summary, include_groups=False).round(3).to_string())
+        print(f"\nBy likely blowout (a team at {BLOWOUT:.0%} or less to win the series):\n"
+              + blowouts(bet).round(3).to_string())
     cal = out[out.result != "PUSH"].assign(bin=lambda d: pd.cut(d.p_over, [0, .3, .4, .5, .6, .7, 1]))
     print("\nCalibration (predicted P(over) vs actual over rate):\n" + cal.groupby("bin", observed=True).agg(
         lines=("p_over", "size"), predicted=("p_over", "mean"),

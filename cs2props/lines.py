@@ -138,7 +138,7 @@ def main():
     use_pf = "--pickfinder" in sys.argv or bool(os.environ.get("PICKFINDER_EMAIL")) and "--no-pickfinder" not in sys.argv
     for src in [prizepicks, underdog, sleeper] + ([pickfinder] if use_pf else []):
         try:
-            got = list(src())
+            got = [r for r in src() if "+" not in str(r["player"])]  # no combo props ("A + B + C": a sum of players)
         except Exception as e:  # one book being down must not lose the others
             print(f"{src.__name__}: FAILED {e!r}", file=sys.stderr)
             continue

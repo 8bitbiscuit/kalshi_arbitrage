@@ -131,6 +131,7 @@ def test_backtest_on_past_lines(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "agrees with bo3.gg on 100.0%" in out and "Calibrated on earlier months' lines" in out
     assert "Line shopping (untimed lines)" in out and "disagree by 1.0 on average" in out
+    assert "By likely blowout" in out and "favorite OVER" in out and "underdog UNDER" in out  # Alpha wins 85% of maps
     pd.testing.assert_series_equal(early.proj, bt.proj)  # listing the match late must not leak its result
     assert len(bt) >= 0.95 * len(late)  # a few series fail load()'s sanity checks and are not graded
     assert (bt[bt.player == "max"].pick == "OVER").mean() > 0.9
@@ -243,7 +244,9 @@ def test_lines_market_and_history(tmp_path, monkeypatch):
                        scraped_at="2026-10-01T09:00:00Z")]).to_csv(lines.HISTORY_CSV, index=False)
     row = dict(stat="kills", maps="1-2", line=30.5, start_time="2026-11-03T02:00:00Z")
     monkeypatch.setattr(lines, "prizepicks", lambda: [dict(book="prizepicks", player="huNter-", team="G2",
-                                                           opponent="Aurora", **row)])
+                                                           opponent="Aurora", **row),
+                                                      dict(book="prizepicks", player="m0NESY + kyousuke + NiKo",  # combo
+                                                           team="Falcons", opponent="G2", **{**row, "line": 98.5})])
     monkeypatch.setattr(lines, "underdog", lambda: [dict(book="underdog", player="woxic", team="Aurora Gaming",
                                                          opponent="G2 Esports", **row)])
     monkeypatch.setattr(lines, "sleeper", lambda: [])
